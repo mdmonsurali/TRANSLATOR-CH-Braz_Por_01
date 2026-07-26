@@ -255,18 +255,30 @@ def json_to_docx(layout_results, output_path="output.docx"):
         elif isinstance(raw_page, list):
             raw_entries = raw_page
         entries = page["entries"] or raw_entries
+        # Pull diagram labels OUT of the reflow stream: they must stay locked to
+        # their parent diagram (rendered by render_diagram_label_overlays), not
+        # drift with the text cascade. They still live in the JSON as normal Text
+        # entries (so OCR output + translation see them); reconstruction just
+        # positions them relative to the diagram rather than reflowing them.
+        diagram_labels = [e for e in entries if e.get("source") == "diagram-label"]
+        entries = [e for e in entries if e.get("source") != "diagram-label"]
         for e in entries:
             if e.get("category") == "Table" and e.get("bbox"):
                 pre_reflow_table_bboxes[id(e)] = list(e["bbox"])
 
             if e.get("category") in ("Image", "Figure", "Picture") and e.get("bbox"):
                 e["_orig_bbox"] = list(e["bbox"])
-        physical_pages.extend(layout_page(
+        laid_out = layout_page(
             entries,
             float(page["page_width_pt"]),
             float(page["page_height_pt"]),
             float(page["zoom"]),
-        ))
+        )
+        # layout_page returns exactly one physical page per source page; stash the
+        # extracted diagram labels on it so the render loop can overlay them.
+        for pp in laid_out:
+            pp["_diagram_labels"] = diagram_labels
+        physical_pages.extend(laid_out)
 
     for idx, page in enumerate(physical_pages):
         entries = page["entries"]
@@ -368,6 +380,37 @@ def json_to_docx(layout_results, output_path="output.docx"):
         # Floating fallback for contained pictures with no image_obj.
         for entry in contained_no_image:
             render_standalone_picture(ctx, entry)
+
+        # Overlay the (translated) diagram labels on top of their diagram raster.
+        # Each label's bbox is in the diagram's ORIGINAL frame, so match it to the
+        # diagram whose pre-reflow bbox contains it, then let the overlay apply the
+        # diagram's cascade-move delta.
+        diagram_labels = page.get("_diagram_labels") or []
+        if diagram_labels:
+            from .picture import render_diagram_label_overlays
+            diagrams = [
+                e for e in entries
+                if e.get("source") == "diagram-recovered" and e.get("bbox")
+            ]
+            for diag in diagrams:
+                ob = diag.get("_orig_bbox") or diag.get("bbox")
+                mine = [
+                    lab for lab in diagram_labels
+                    if lab.get("bbox") and _bbox_inside(lab["bbox"], ob)
+                ]
+                render_diagram_label_overlays(ctx, diag, mine)
+            # Any label not inside a matched diagram (rare) — anchor to the first
+            # diagram if present so it is never silently dropped.
+            if diagrams:
+                claimed = {
+                    id(lab) for diag in diagrams
+                    for lab in diagram_labels
+                    if lab.get("bbox") and _bbox_inside(
+                        lab["bbox"], diag.get("_orig_bbox") or diag.get("bbox"))
+                }
+                orphans = [lab for lab in diagram_labels if id(lab) not in claimed]
+                if orphans:
+                    render_diagram_label_overlays(ctx, diagrams[0], orphans)
 
         ctx.flush()
         shape_counter = ctx.next_id + 1

@@ -42,14 +42,25 @@ from ocr_reconstruction.table import (
 log = logging.getLogger("ocr_service")
 
 
-# Blob detection tuning. A pixel is "ink" below this 8-bit gray level; a page
-# row counts as part of a photo when at least DARK_ROW_FRAC of the column strip
-# is ink. Bands shorter than MIN_BAND_PX are noise (stray specks / thin rules).
+# Blob detection tuning. A pixel is "ink" below this 8-bit gray level.
 INK_LEVEL = 180
-DARK_ROW_FRAC = 0.12
+# A row is "occupied" when at least ROW_INK_FRAC of the column strip is ink.
+# This must be LOW: a photo band fills most of a row (high ink), but a technical
+# LINE DRAWING (a screw / diagram) is mostly white — its outline touches only a
+# few percent of any given row, so a high threshold (the old 0.12) collapsed
+# such bands into stray slivers or dropped them entirely. A low per-row gate
+# catches line-art; band-level total-ink gating (below) rejects the false
+# positives (blank cell padding, a single thin ruling) that a low gate lets in.
+ROW_INK_FRAC = 0.02
+# A detected band is kept only if its interior carries at least this fraction of
+# ink overall — enough to distinguish a real drawing/photo from empty padding or
+# a lone horizontal rule. Line drawings clear this comfortably; blank space does
+# not.
+BAND_INK_FRAC = 0.012
 MIN_BAND_PX = 20
-# Merge photo bands separated by a gap smaller than this (a single photo can
-# have a light horizontal seam that briefly drops below DARK_ROW_FRAC).
+# Merge photo bands separated by a gap smaller than this (a single photo/drawing
+# can have a light horizontal seam that briefly drops below ROW_INK_FRAC — e.g.
+# the gap between a screw's head and its shaft hatching).
 MERGE_GAP_PX = 24
 # Inset the crop a couple px so we don't grab the cell border line.
 CROP_INSET_PX = 2
@@ -122,15 +133,22 @@ def _column_x_edges(
 
 
 def _detect_photo_bands(strip: np.ndarray) -> List[Tuple[int, int]]:
-    """Contiguous (y0, y1) bands of photo content down a grayscale column strip.
+    """Contiguous (y0, y1) bands of picture content down a grayscale column strip.
 
-    A band is a run of rows whose ink fraction exceeds DARK_ROW_FRAC; runs are
-    merged across gaps < MERGE_GAP_PX and runs shorter than MIN_BAND_PX dropped.
+    Works for both dense photos AND sparse line drawings (technical screw /
+    diagram art). A band is a run of rows whose ink fraction exceeds the low
+    ROW_INK_FRAC gate; runs are merged across gaps < MERGE_GAP_PX, runs shorter
+    than MIN_BAND_PX dropped, and — critically — a surviving band is kept only if
+    its interior ink fraction clears BAND_INK_FRAC. The low per-row gate lets
+    line-art through (its outline touches few pixels per row); the band-level
+    gate then throws out blank padding and lone thin rulings that the low gate
+    would otherwise admit.
     """
     if strip.ndim != 2 or strip.shape[0] == 0 or strip.shape[1] == 0:
         return []
-    ink_frac = (strip < INK_LEVEL).mean(axis=1)
-    mask = ink_frac > DARK_ROW_FRAC
+    ink = strip < INK_LEVEL
+    ink_frac = ink.mean(axis=1)
+    mask = ink_frac > ROW_INK_FRAC
 
     bands: List[Tuple[int, int]] = []
     start: Optional[int] = None
@@ -143,7 +161,8 @@ def _detect_photo_bands(strip: np.ndarray) -> List[Tuple[int, int]]:
     if start is not None:
         bands.append((start, len(mask)))
 
-    # Merge bands separated by a small gap (a light seam within one photo).
+    # Merge bands separated by a small gap (a light seam within one photo, or the
+    # break between a screw head and its shaft).
     merged: List[Tuple[int, int]] = []
     for b in bands:
         if merged and b[0] - merged[-1][1] < MERGE_GAP_PX:
@@ -151,7 +170,16 @@ def _detect_photo_bands(strip: np.ndarray) -> List[Tuple[int, int]]:
         else:
             merged.append(b)
 
-    return [(a, z) for (a, z) in merged if (z - a) >= MIN_BAND_PX]
+    kept: List[Tuple[int, int]] = []
+    for (a, z) in merged:
+        if (z - a) < MIN_BAND_PX:
+            continue
+        # Reject bands that are mostly blank (padding) or a single hairline rule:
+        # a genuine drawing/photo fills at least BAND_INK_FRAC of its area.
+        if ink[a:z, :].mean() < BAND_INK_FRAC:
+            continue
+        kept.append((a, z))
+    return kept
 
 
 def _equal_bands(height: int, n: int) -> List[Tuple[int, int]]:

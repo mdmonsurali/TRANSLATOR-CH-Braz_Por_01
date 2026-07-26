@@ -66,10 +66,10 @@ NON_TEXT_CATEGORIES = {"Picture"}
 TRANSLATE_FORMULA_TEXT = os.getenv("TRANSLATE_FORMULA_TEXT", "true").lower() == "true"
 
 # Targets the model into a strict JSON contract so we can parse the response
-# without regex slop. Gemma 3 follows this format reliably.
+# without regex slop. Qwen3 follows this format reliably.
 #
 # NOTE: we intentionally do NOT ask the model to "preserve proper nouns" — that
-# made Gemma leave Chinese company names ("山东威高骨科…"), product names and
+# made the model leave Chinese company names ("山东威高骨科…"), product names and
 # section labels untranslated. The only things that must survive verbatim are
 # ASCII codes / numbers / units and LaTeX/HTML markup.
 _SYSTEM_PROMPT_TEMPLATE = (
@@ -113,8 +113,25 @@ def _contains_cjk(s: str) -> bool:
 
 # ── Response decoding (unchanged) ──────────────────────────────────────────
 
+# Qwen3 (and other reasoning models) can emit a leading <think>...</think>
+# block before the JSON answer. The llama-server `--reasoning-budget 0` flag
+# suppresses this at the source, but strip it here too as a belt-and-suspenders
+# guard so a stray reasoning block never breaks JSON parsing on any build.
+_THINK_BLOCK_RE = re.compile(r"<think>.*?</think>", re.S | re.I)
+
+
+def _strip_think_block(text: str) -> str:
+    s = _THINK_BLOCK_RE.sub("", text)
+    # An unterminated <think> (truncated / budget-clamped) leaves an open tag
+    # with no closer — drop everything up to and including it.
+    if "<think>" in s.lower():
+        idx = s.lower().rfind("<think>")
+        s = s[idx + len("<think>"):]
+    return s.strip()
+
+
 def _strip_code_fences(text: str) -> str:
-    s = text.strip()
+    s = _strip_think_block(text)
     if s.startswith("```"):
         s = re.sub(r"^```(?:json)?\s*", "", s, flags=re.IGNORECASE)
         if s.endswith("```"):
@@ -282,6 +299,7 @@ def _collect_units(layout: List[dict]
     for page in layout:
         for entry in page.get("entries") or []:
             cat = entry.get("category")
+
             text = entry.get("text")
             if not isinstance(text, str) or not text.strip():
                 continue

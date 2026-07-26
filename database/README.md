@@ -1,6 +1,6 @@
 # database/
 
-PostgreSQL data model and SQL files for MONTASHI-CHDR_OCR-TRANSLATOR.
+PostgreSQL data model and SQL files for TRANSLATOR-CH-Braz_Por.
 
 ## Data model
 

@@ -59,7 +59,7 @@ async def lifespan(app: FastAPI):
     await db.close_pool()
 
 
-app = FastAPI(title="MONTASHI-CHDR_OCR-TRANSLATOR Auth", version="1.0", lifespan=lifespan)
+app = FastAPI(title="TRANSLATOR-CH-Braz_Por Auth", version="1.0", lifespan=lifespan)
 
 
 def _set_session_cookie(resp: Response, session_id: _uuid.UUID) -> None:

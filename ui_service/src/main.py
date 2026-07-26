@@ -54,7 +54,7 @@ ORCHESTRATOR_SERVICE_URL = os.environ.get(
     "ORCHESTRATOR_SERVICE_URL", "http://orchestrator_service:8004",
 )
 
-app = FastAPI(title="MONTASHI-CHDR_OCR-TRANSLATOR UI", docs_url=None, redoc_url=None)
+app = FastAPI(title="TRANSLATOR-CH-Braz_Por UI", docs_url=None, redoc_url=None)
 app.add_middleware(AuthMiddleware)
 
 

@@ -318,6 +318,11 @@ def json_to_docx(layout_results, output_path="output.docx"):
         for entry in entries:
             if _is_picture(entry):
                 continue
+            if entry.get("source") == "diagram-label":
+                # Rendered as a white overlay on the diagram below, not as normal
+                # positioned text (which would be transparent and let the original
+                # glyphs show through).
+                continue
             if _is_table(entry):
                 render_table(
                     ctx,
@@ -336,6 +341,23 @@ def json_to_docx(layout_results, output_path="output.docx"):
         # Floating fallback for contained pictures with no image_obj.
         for entry in contained_no_image:
             render_standalone_picture(ctx, entry)
+
+        # Overlay diagram labels (source="diagram-label") on top of their diagram
+        # raster. Match each to the diagram whose bbox contains it.
+        diagram_labels = [e for e in entries if e.get("source") == "diagram-label"]
+        if diagram_labels:
+            from .picture import render_diagram_label_overlays
+            diagrams = [
+                e for e in entries
+                if e.get("source") == "diagram-recovered" and e.get("bbox")
+            ]
+            for diag in diagrams:
+                db = diag.get("bbox")
+                mine = [
+                    lab for lab in diagram_labels
+                    if lab.get("bbox") and _bbox_inside(lab["bbox"], db)
+                ]
+                render_diagram_label_overlays(ctx, diag, mine)
 
         ctx.flush()
         shape_counter = ctx.next_id + 1

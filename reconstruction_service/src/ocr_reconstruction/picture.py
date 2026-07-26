@@ -116,3 +116,74 @@ def render_standalone_picture(ctx, entry: Dict) -> None:
             pic_name=entry.get("id") or "Picture",
         )
     )
+
+
+# The white overlay box stays at the DETECTED bbox (never grows). Longer text is
+# made to fit by shrinking the font down to this floor. Matches the translation
+# path so the OCR (untranslated) docx reads consistently.
+_DIAG_LABEL_MIN_FONT_PT = 4.0
+
+
+def render_diagram_label_overlays(ctx, diagram_entry: Dict,
+                                  label_entries: list) -> None:
+    """Overlay diagram labels as white-filled text boxes on top of the diagram
+    raster. `label_entries` are top-level `source="diagram-label"` Text entries.
+    The OCR path does not reflow, so labels render at their detected bbox."""
+    if not label_entries:
+        return
+
+    from .geometry import bbox_px_to_emu
+    from .ooxml import (
+        build_anchored_textbox_xml, build_paragraph_xml, build_run_xml,
+    )
+    from .text_fit import fit_multiline
+
+    zoom = ctx.zoom
+    live = diagram_entry.get("bbox")
+    orig = diagram_entry.get("bbox") or live  # OCR path: no move, delta is 0
+    dx = float(live[0]) - float(orig[0])
+    dy = float(live[1]) - float(orig[1])
+
+    for region in label_entries:
+        text = (region.get("text") or "").strip()
+        rb = region.get("bbox")
+        if not text or not rb or len(rb) != 4:
+            continue
+        x1 = float(rb[0]) + dx
+        y1 = float(rb[1]) + dy
+        x2 = float(rb[2]) + dx
+        y2 = float(rb[3]) + dy
+        if x2 <= x1 or y2 <= y1:
+            continue
+
+        # Keep the box at the DETECTED bbox — never grow it; shrink the font to fit.
+        box_w_pt = max(1.0, (x2 - x1) / zoom)
+        box_h_pt = max(1.0, (y2 - y1) / zoom)
+        style = dict(region.get("style") or {})
+        base_size_pt = float(style.get("size") or 11.0)
+        bold_render = bool(style.get("bold"))
+
+        fit_size_pt, lines = fit_multiline(
+            text, box_w_pt, box_h_pt,
+            max_size_pt=base_size_pt, min_size_pt=_DIAG_LABEL_MIN_FONT_PT,
+            bold=bold_render,
+        )
+        if lines is None:
+            style["size"] = _DIAG_LABEL_MIN_FONT_PT
+            processed_text = text
+        else:
+            style["size"] = fit_size_pt
+            processed_text = "\n".join(lines)
+        body_auto_fit = False
+
+        x, y, bw, bh = bbox_px_to_emu(
+            [x1, y1, x2, y2], zoom, ctx.page_w_pt, ctx.page_h_pt,
+        )
+        runs_xml = build_run_xml(processed_text, style)
+        para_xml = build_paragraph_xml(runs_xml, alignment="center", line_pt=None)
+        ctx.xml_chunks.append(
+            build_anchored_textbox_xml(
+                x, y, bw, bh, para_xml, ctx._next_id(),
+                body_auto_fit=body_auto_fit, fill_rgb="FFFFFF",
+            )
+        )

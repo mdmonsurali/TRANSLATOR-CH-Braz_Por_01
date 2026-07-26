@@ -249,7 +249,7 @@ async def swap_to_translator(emit: Optional[EmitStatus] = None) -> None:
 
     await _emit(emit, "status", {
         "phase": "swap-to-translator",
-        "message": "Waiting for translator healthcheck (Gemma load takes 30-90s)",
+        "message": "Waiting for translator healthcheck (Qwen3 load takes 30-90s)",
     })
     await wait_healthy(TRANSLATOR_CONTAINER_NAME, emit=emit)
     await _emit(emit, "status", {

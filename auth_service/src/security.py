@@ -6,7 +6,7 @@ from datetime import timedelta
 
 from passlib.context import CryptContext
 
-SESSION_COOKIE_NAME = "montashi_session"
+SESSION_COOKIE_NAME = "translator_ch_braz_por_session"
 SESSION_TTL = timedelta(hours=int(os.getenv("SESSION_TTL_HOURS", "12")))
 COOKIE_SECURE = os.getenv("COOKIE_SECURE", "false").strip().lower() in {"1", "true", "yes", "on"}
 

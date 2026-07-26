@@ -25,6 +25,20 @@ RUN sed -i 's|<policy domain="coder" rights="none" pattern="PDF"|<policy domain=
 COPY ocr_service/requirements.txt /workspace/ocr_service/
 RUN pip3 install --no-cache-dir -r /workspace/ocr_service/requirements.txt
 
+# Isolated PaddleOCR venv for diagram text-label detection. PaddleOCR pins
+# numpy<2.6 / opencv<4.13, which CONFLICT with vLLM's numpy>=2.0 / opencv>=4.13
+# in the main env — so it lives in its own venv and is called as a subprocess
+# (see ocr_service/src/paddle_ocr_worker.py + diagram_text_recovery.py). Its
+# numpy never touches the vLLM environment.
+RUN python3 -m venv /opt/paddle-venv && \
+    /opt/paddle-venv/bin/pip install --no-cache-dir \
+        setuptools paddlepaddle==3.0.0 paddleocr==2.9.1
+# Pre-bake the Chinese detection+recognition+classification models so the first
+# diagram at runtime doesn't trigger a network download (PaddleOCR fetches to
+# ~/.paddleocr by default; HOME=/root in this image).
+RUN /opt/paddle-venv/bin/python -c \
+    "from paddleocr import PaddleOCR; PaddleOCR(use_angle_cls=False, lang='ch', show_log=False)"
+
 # Pre-bake the Chandra OCR 2 weights into the image so cold start does not
 # depend on a runtime HuggingFace download. Pass --build-arg HF_TOKEN=... if
 # the repo is gated. Weights land in the standard HF cache so `vllm serve

@@ -1,4 +1,4 @@
-name: montashi-ocr
+name: translator-ch-braz-por
 
 services:
   ocr_service:
@@ -99,7 +99,7 @@ services:
     build:
       context: .
       dockerfile: orchestrator_service/Dockerfile
-    image: montashi-orchestrator:latest
+    image: translator-ch-braz-por-orchestrator:latest
     container_name: orchestrator_service
     environment:
       - ORCHESTRATOR_SERVICE_PORT=8004
@@ -129,7 +129,7 @@ services:
     build:
       context: .
       dockerfile: translator_service/Dockerfile
-    image: montashi-translator:latest
+    image: translator-ch-braz-por-translator:latest
     container_name: translator_service
     environment:
       - TRANSLATOR_SERVICE_PORT=8003
@@ -197,7 +197,7 @@ services:
     build:
       context: .
       dockerfile: auth_service/Dockerfile
-    image: montashi-auth:latest
+    image: translator-ch-braz-por-auth:latest
     container_name: auth_service
     ports:
       - "${AUTH_SERVICE_PORT:-8002}:8002"

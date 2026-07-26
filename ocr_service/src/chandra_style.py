@@ -178,6 +178,11 @@ def attribute_page(
         if category in PICTURE_LABELS:
             # Rasters carry no attributable text.
             continue
+        if entry.get("source") == "diagram-label":
+            # PaddleOCR-recovered diagram labels already carry a deliberate style
+            # and sit over a raster (no PDF spans there); keep their style so the
+            # bbox-heuristic doesn't inflate the font.
+            continue
         bbox_px = entry.get("bbox")
         if not bbox_px or len(bbox_px) != 4:
             entry["style"] = _heuristic_style(entry, zoom)

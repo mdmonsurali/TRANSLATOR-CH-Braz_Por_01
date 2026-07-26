@@ -1,4 +1,4 @@
-# MONTASHI-CHDR_OCR-TRANSLATOR
+# TRANSLATOR-CH-Braz_Por
 
 A microservice pipeline that turns scanned/native PDFs and DOCX files into
 structured, layout-preserving output: OCR → layout JSON → reconstructed DOCX,

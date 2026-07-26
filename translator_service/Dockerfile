@@ -28,8 +28,8 @@ RUN pip3 install --no-cache-dir -r /workspace/translator_service/requirements.tx
 
 # Download the GGUF at build time so first-boot is fast. Override at build
 # with --build-arg TRANSLATOR_MODEL_REPO=... TRANSLATOR_MODEL_FILE=...
-ARG TRANSLATOR_MODEL_REPO=ggml-org/gemma-3-12b-it-GGUF
-ARG TRANSLATOR_MODEL_FILE=gemma-3-12b-it-Q4_K_M.gguf
+ARG TRANSLATOR_MODEL_REPO=Qwen/Qwen3-14B-GGUF
+ARG TRANSLATOR_MODEL_FILE=Qwen3-14B-Q8_0.gguf
 
 ENV TRANSLATOR_MODEL_PATH=/models/translator.gguf
 ENV TRANSLATOR_MODEL_REPO=${TRANSLATOR_MODEL_REPO}
@@ -86,6 +86,7 @@ CMD ["\
         --parallel \"$LLAMA_PARALLEL\" \
         --no-warmup \
         --jinja \
+        --reasoning-budget 0 \
         --log-disable & \
     LLAMA_PID=$!; \
     echo \"[translator] waiting for llama-server (PID $LLAMA_PID)...\"; \

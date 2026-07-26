@@ -11,12 +11,12 @@ from security import SESSION_COOKIE_NAME
 
 
 async def current_session(
-    montashi_session: Optional[str] = Cookie(default=None, alias=SESSION_COOKIE_NAME),
+    session_cookie: Optional[str] = Cookie(default=None, alias=SESSION_COOKIE_NAME),
 ) -> dict:
-    if not montashi_session:
+    if not session_cookie:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Not authenticated")
     try:
-        sid = _uuid.UUID(montashi_session)
+        sid = _uuid.UUID(session_cookie)
     except (ValueError, TypeError):
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Invalid session")
     row = await db.fetch_session_with_user(sid)

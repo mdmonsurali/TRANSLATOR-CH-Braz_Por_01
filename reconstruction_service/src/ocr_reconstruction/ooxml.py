@@ -286,6 +286,7 @@ def build_anchored_textbox_xml(
     inner_body_xml: str,
     docpr_id: int,
     body_auto_fit: bool = False,
+    fill_rgb: str | None = None,
 ) -> str:
     """Floating text box anchored at (x,y) on the page, holding arbitrary
     `<w:p>...` content. Returns an `<mc:AlternateContent>` block to drop
@@ -297,9 +298,17 @@ def build_anchored_textbox_xml(
     Otherwise `<a:noAutofit/>` is used so the layout-faithful exact-fit path
     (frozen wrap + pinned line height in add_text_entry) gets the precise
     box height it measured.
+
+    `fill_rgb` is an optional 6-hex-digit solid fill (e.g. "FFFFFF"). Default
+    (None) keeps the box transparent (`<a:noFill/>`). An opaque fill overlays
+    diagram labels on top of a raster, hiding the original-language glyphs.
     """
     name = f"TxtBox{docpr_id}"
     autofit_xml = "<a:spAutoFit/>" if body_auto_fit else "<a:noAutofit/>"
+    fill_xml = (
+        f'<a:solidFill><a:srgbClr val="{fill_rgb}"/></a:solidFill>'
+        if fill_rgb else "<a:noFill/>"
+    )
     return (
         f'<mc:AlternateContent{attrs_for_anchor()}>'
         f'<mc:Choice Requires="wps">'
@@ -323,7 +332,7 @@ def build_anchored_textbox_xml(
         f'<a:off x="0" y="0"/><a:ext cx="{w_emu}" cy="{h_emu}"/>'
         f'</a:xfrm>'
         f'<a:prstGeom prst="rect"><a:avLst/></a:prstGeom>'
-        f'<a:noFill/>'
+        f'{fill_xml}'
         f'<a:ln><a:noFill/></a:ln>'
         f'</wps:spPr>'
         f'<wps:txbx><w:txbxContent>{inner_body_xml}</w:txbxContent></wps:txbx>'

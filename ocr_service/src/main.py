@@ -50,6 +50,7 @@ from picture_recovery import recover_missing_pictures
 from cell_picture_recovery import recover_table_cell_pictures
 from table_reocr import recover_dropped_table_rows
 from checkbox_reocr import recover_dropped_checkboxes
+from diagram_text_recovery import recover_diagram_text
 
 import storage
 
@@ -343,6 +344,11 @@ async def _run_pipeline(in_path: Path, source_bytes: bytes, original_name: str,
             # for recover_missing_pictures to find). Crops them from the page
             # raster by content-blob detection down each image column.
             recover_table_cell_pictures(pages)
+            # Recover the TEXT LABELS inside each recovered diagram (mermaid loses
+            # them) by re-OCRing the crop, so the boxes/diamonds/edge labels can
+            # be translated and overlaid in place instead of staying in the source
+            # language baked into the raster.
+            await recover_diagram_text(pages)
 
         if not INCLUDE_PICTURES:
             for page in pages:
