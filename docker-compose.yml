@@ -1,4 +1,4 @@
-name: translator-ch-braz-por
+name: translator-ch-braz-por-01
 
 services:
   ocr_service:
@@ -26,10 +26,37 @@ services:
       - OCR_BATCH_SIZE_SCANNED=${OCR_BATCH_SIZE_SCANNED:-4}
       - OCR_MAX_TOKENS=${OCR_MAX_TOKENS:-12384}
       - OCR_MAX_RETRIES=${OCR_MAX_RETRIES:-6}
+      # Retry on a suspected repeat-token loop. Default OFF: the detector is not
+      # HTML-aware and false-positives on legitimately repetitive QC tables.
+      # Timeout/error retries are unaffected. See .env for the measurements.
+      - OCR_REPEAT_RETRY=${OCR_REPEAT_RETRY:-false}
+      # PER-PAGE ceiling on one generation. Without it a degenerate page streams
+      # forever and hangs the whole document in `processing`. This is the
+      # timeout that actually protects the pipeline.
+      - OCR_REQUEST_TIMEOUT_SEC=${OCR_REQUEST_TIMEOUT_SEC:-600}
+      # LibreOffice DOCX->PDF for inline preview. Downloads are unaffected.
+      - PREVIEW_TIMEOUT_SEC=${PREVIEW_TIMEOUT_SEC:-600}
+      # Pages rendered/OCR'd/freed per window — caps peak RAM independently of
+      # document length. Must be >= the effective OCR batch size.
+      - OCR_PAGE_WINDOW=${OCR_PAGE_WINDOW:-32}
+      # Reject documents above this page count (0 = unlimited). Backstop only.
+      - OCR_MAX_PAGES=${OCR_MAX_PAGES:-0}
+      - PDF_RENDER_DPI=${PDF_RENDER_DPI:-300}
       - INCLUDE_PICTURES=${INCLUDE_PICTURES:-true}
       - ATTRIBUTE_STYLES=${ATTRIBUTE_STYLES:-true}
       - FORMULA_SIZE_MULTIPLIER=${FORMULA_SIZE_MULTIPLIER:-1.6}
       - FORMULA_BOLD=${FORMULA_BOLD:-true}
+      # Rotated-table support: detection + de-rotated re-OCR + landscape
+      # reconstruction. Default OFF — it costs one PaddleOCR probe per candidate
+      # table and most tables are upright. Turn on for landscape QC/inspection
+      # scans. See .env for the measurements.
+      - OCR_ROTATION=${OCR_ROTATION:-false}
+      # Diagram text-label detection (PaddleOCR) — its own service so its
+      # paddlepaddle/paddlex stack can never collide with vLLM's numpy/opencv.
+      - PADDLE_SERVICE_URL=http://paddle_service:8005
+      - DIAGRAM_OCR_LANG=${DIAGRAM_OCR_LANG:-ch}
+      - DIAGRAM_OCR_TIMEOUT_SEC=${DIAGRAM_OCR_TIMEOUT_SEC:-300}
+      - DIAGRAM_OCR_MIN_CONF=${DIAGRAM_OCR_MIN_CONF:-0.45}
       # Postgres
       - POSTGRES_HOST=postgres
       - POSTGRES_PORT=5432
@@ -52,7 +79,9 @@ services:
               device_ids: ["${GPU_DEVICE_ID:-0}"]
               capabilities: [gpu]
         limits:
-          memory: 16G
+          # Shared by uvicorn AND the vLLM engine process — the engine alone
+          # needs ~5 GB host RAM, so this is not all available to the pipeline.
+          memory: ${OCR_MEM_LIMIT:-24G}
     shm_size: '16gb'
     ipc: host
     restart: unless-stopped
@@ -68,6 +97,44 @@ services:
         condition: service_healthy
       minio:
         condition: service_healthy
+      paddle_service:
+        condition: service_healthy
+    networks:
+      - ocr-network
+
+  # PaddleOCR text-line detection for diagram labels. A separate service purely
+  # for dependency isolation: PaddleOCR floats numpy/opencv/pillow against
+  # vLLM's pins (numpy 2.3.5 vs 2.2.6, opencv-contrib 4.10 vs headless 4.13), and
+  # a distinct image makes a collision structurally impossible. CPU-only — it
+  # must NOT take GPU memory from vLLM.
+  paddle_service:
+    build:
+      context: .
+      dockerfile: paddle_service/Dockerfile
+    image: translator-ch-braz-por-01-paddle:latest
+    container_name: paddle_service
+    environment:
+      - DIAGRAM_OCR_LANG=${DIAGRAM_OCR_LANG:-ch}
+    expose:
+      - "8005"
+    deploy:
+      resources:
+        limits:
+          # PaddleOCR peaks far above its ~1.2 GiB idle footprint on full-page
+          # crops: measured 3.2+ GiB on a 2000x2800 diagram crop, which killed
+          # the container at a 4G limit (7 restarts, each one rebuilding the
+          # model and failing the in-flight request with RemoteProtocolError /
+          # ConnectError on the ocr_service side). 8G leaves real headroom.
+          memory: ${PADDLE_MEM_LIMIT:-8G}
+    restart: unless-stopped
+    healthcheck:
+      # /health deliberately does not build the model, so this goes green
+      # quickly; the ~2.5 s pipeline construction happens on the first crop.
+      test: ["CMD", "curl", "-f", "http://localhost:8005/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
     networks:
       - ocr-network
 
@@ -99,7 +166,7 @@ services:
     build:
       context: .
       dockerfile: orchestrator_service/Dockerfile
-    image: translator-ch-braz-por-orchestrator:latest
+    image: translator-ch-braz-por-01-orchestrator:latest
     container_name: orchestrator_service
     environment:
       - ORCHESTRATOR_SERVICE_PORT=8004
@@ -110,6 +177,12 @@ services:
       - TRANSLATOR_CONTAINER_NAME=translator_service
       - SWAP_HEALTH_TIMEOUT_SEC=${SWAP_HEALTH_TIMEOUT_SEC:-300}
       - TRANSLATE_TARGET_LANG=${TRANSLATE_TARGET_LANG:-pt-BR}
+      # Whole-document calls — SAFETY NETS only. The per-page (OCR) and
+      # per-chunk (translate) timeouts are what bound real work; these exist so
+      # a crashed peer or dropped socket eventually raises instead of blocking
+      # the batch forever with no error and no SSE event.
+      - OCR_TIMEOUT_SEC=${OCR_TIMEOUT_SEC:-86400}
+      - TRANSLATE_TIMEOUT_SEC=${TRANSLATE_TIMEOUT_SEC:-86400}
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
     depends_on:
@@ -129,7 +202,7 @@ services:
     build:
       context: .
       dockerfile: translator_service/Dockerfile
-    image: translator-ch-braz-por-translator:latest
+    image: translator-ch-braz-por-01-translator:latest
     container_name: translator_service
     environment:
       - TRANSLATOR_SERVICE_PORT=8003
@@ -141,12 +214,29 @@ services:
       - LLAMA_GPU_LAYERS=${LLAMA_GPU_LAYERS:-999}
       - LLAMA_CTX_SIZE=${LLAMA_CTX_SIZE:-8192}
       - LLAMA_PARALLEL=${LLAMA_PARALLEL:-2}
+      # Prompt-prefix reuse (the system prompt is re-sent on every chunk) and an
+      # explicit HTTP worker pool. 0 / -1 are llama.cpp's defaults.
+      - LLAMA_CACHE_REUSE=${LLAMA_CACHE_REUSE:-256}
+      - LLAMA_THREADS_HTTP=${LLAMA_THREADS_HTTP:-8}
+      # Set LLAMA_EXTRA_ARGS= (empty) to unmute llama-server when diagnosing a
+      # "died before becoming ready" startup failure.
+      - LLAMA_EXTRA_ARGS=${LLAMA_EXTRA_ARGS:---log-disable}
       # Translation behaviour
       - TRANSLATE_TARGET_LANG=${TRANSLATE_TARGET_LANG:-pt-BR}
       - TRANSLATE_CONCURRENCY=${TRANSLATE_CONCURRENCY:-2}
-      - TRANSLATE_CHUNK_ITEMS=${TRANSLATE_CHUNK_ITEMS:-20}
+      # Items per llama.cpp request. Raised from 20: table cells are short, so
+      # the item count binds long before TRANSLATE_CHUNK_BYTES and each request
+      # carried little payload for full per-request overhead.
+      - TRANSLATE_CHUNK_ITEMS=${TRANSLATE_CHUNK_ITEMS:-40}
       - TRANSLATE_CHUNK_BYTES=${TRANSLATE_CHUNK_BYTES:-4000}
       - TRANSLATE_MAX_TOKENS=${TRANSLATE_MAX_TOKENS:-4096}
+      # Pages per translation group. Bounds memory AND sets the checkpoint
+      # interval — a job that dies resumes from the last completed group.
+      - TRANSLATE_PAGE_WINDOW=${TRANSLATE_PAGE_WINDOW:-25}
+      # PER-REQUEST ceiling on one llama.cpp call (one chunk of strings).
+      - TRANSLATE_REQUEST_TIMEOUT_SEC=${TRANSLATE_REQUEST_TIMEOUT_SEC:-600}
+      # Whole-document OCR call — 24h safety net, not a job limit.
+      - OCR_TIMEOUT_SEC=${OCR_TIMEOUT_SEC:-86400}
       # Formula rendering style (used when generating the translated DOCX)
       - FORMULA_SIZE_MULTIPLIER=${FORMULA_SIZE_MULTIPLIER:-1.6}
       - FORMULA_BOLD=${FORMULA_BOLD:-true}
@@ -178,7 +268,13 @@ services:
     restart: "no"
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8003/health"]
-      interval: 30s
+      # `interval` applies only AFTER the first successful probe; `start_interval`
+      # is the cadence DURING `start_period`. So startup is still probed every
+      # 15s (the orchestrator's GPU swap waits on healthy and must not be slowed),
+      # while a long-lived container is not polled every 30s for the rest of the
+      # run — llama-server holds the GPU and a steady-state poll buys nothing.
+      # Matches ocr_service, which uses the same 24h/start_interval pairing.
+      interval: 24h
       timeout: 10s
       retries: 3
       start_period: 600s
@@ -197,7 +293,7 @@ services:
     build:
       context: .
       dockerfile: auth_service/Dockerfile
-    image: translator-ch-braz-por-auth:latest
+    image: translator-ch-braz-por-01-auth:latest
     container_name: auth_service
     ports:
       - "${AUTH_SERVICE_PORT:-8002}:8002"

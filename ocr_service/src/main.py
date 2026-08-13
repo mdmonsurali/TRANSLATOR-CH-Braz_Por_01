@@ -22,6 +22,7 @@ import io
 import json as _json
 import logging
 import os
+import shutil
 import subprocess
 import tempfile
 import time
@@ -37,11 +38,14 @@ from fastapi.responses import JSONResponse, Response, StreamingResponse
 from PIL import Image
 
 from doc_processing import (
+    docx_to_pdf,
     extract_font_spans,
     layoutjson2md,
+    load_page_range,
     load_pages_from_docx,
     load_pages_from_image,
     load_pages_from_pdf,
+    page_count_for_pdf,
 )
 from ocr_reconstruction import json_to_docx, process_pictures
 from chandra_ocr import process_image_async, PICTURE_LABELS
@@ -51,6 +55,8 @@ from cell_picture_recovery import recover_table_cell_pictures
 from table_reocr import recover_dropped_table_rows
 from checkbox_reocr import recover_dropped_checkboxes
 from diagram_text_recovery import recover_diagram_text
+from rotation_detect import detect_rotation
+from table_validate import validate_tables
 
 import storage
 
@@ -89,6 +95,15 @@ REOCR_DROPPED_CHECKBOXES = os.getenv(
 }
 
 ARTIFACT_KINDS = {"source", "md", "json", "docx"}
+
+# Pages are rendered, OCR'd and freed one window at a time so peak memory is a
+# function of the window rather than the document length. Must be >= the OCR
+# batch size or it would throttle concurrency below the semaphore.
+PAGE_WINDOW = int(os.getenv("OCR_PAGE_WINDOW", "32"))
+# Backstop only — windowing is what actually bounds memory. Keeps a
+# pathologically large upload from being a slow way to exhaust the container
+# instead of a fast 413. 0 disables the check.
+MAX_PAGES = int(os.getenv("OCR_MAX_PAGES", "0"))
 
 
 # Identity — trusted from ui_service over the docker network. Drop the
@@ -160,7 +175,10 @@ def _pages_from_path(in_path: Path) -> List[dict]:
     """One geometry-aware page dict per page for any supported input type.
 
     Each dict has: image, page_width_pt, page_height_pt, zoom, page_index,
-    pdf_source (None for raw image inputs)."""
+    pdf_source (None for raw image inputs).
+
+    Renders the whole document at once — the pipeline uses `_open_page_source`
+    instead. Kept for callers that want a plain page list."""
     ext = in_path.suffix.lower()
     if ext in {".png", ".jpg", ".jpeg"}:
         return load_pages_from_image(str(in_path))
@@ -168,6 +186,51 @@ def _pages_from_path(in_path: Path) -> List[dict]:
         return load_pages_from_pdf(str(in_path))
     if ext == ".docx":
         return load_pages_from_docx(str(in_path))
+    raise HTTPException(415, f"Unsupported file type: {ext}")
+
+
+class _PageSource:
+    """A document's pages, renderable one window at a time.
+
+    `render(start, end)` returns page dicts for [start, end) — identical in
+    shape to `_pages_from_path`, with absolute `page_index`. `cleanup()`
+    removes the intermediate PDF that DOCX inputs convert through; it must not
+    be called until the document is fully processed, because `pdf_source`
+    points into that directory and the recovery passes re-open it by path.
+    """
+
+    __slots__ = ("count", "_render", "_temp_dir")
+
+    def __init__(self, count: int, render, temp_dir: str | None = None):
+        self.count = count
+        self._render = render
+        self._temp_dir = temp_dir
+
+    def render(self, start: int, end: int) -> List[dict]:
+        return self._render(start, end)
+
+    def cleanup(self) -> None:
+        if self._temp_dir:
+            shutil.rmtree(self._temp_dir, ignore_errors=True)
+            self._temp_dir = None
+
+
+def _open_page_source(in_path: Path) -> _PageSource:
+    """Prepare `in_path` for windowed rendering without rasterizing anything."""
+    ext = in_path.suffix.lower()
+    if ext in {".png", ".jpg", ".jpeg"}:
+        # Single page; rendering is cheap and there is no PDF to window over.
+        return _PageSource(
+            1, lambda s, e: load_pages_from_image(str(in_path)) if s == 0 and e > 0 else [])
+    if ext == ".pdf":
+        src = str(in_path)
+        return _PageSource(page_count_for_pdf(src),
+                           lambda s, e: load_page_range(src, s, e))
+    if ext == ".docx":
+        pdf_path, temp_dir = docx_to_pdf(str(in_path))
+        return _PageSource(page_count_for_pdf(pdf_path),
+                           lambda s, e: load_page_range(pdf_path, s, e),
+                           temp_dir=temp_dir)
     raise HTTPException(415, f"Unsupported file type: {ext}")
 
 
@@ -202,11 +265,15 @@ def _batch_size_for(scan_type: str) -> int:
 async def _ocr_one_page_async(page_meta: dict, sem: asyncio.Semaphore) -> dict:
     """Run OCR for one page and merge the layout result into the geometry dict."""
     img = page_meta["image"]
-    with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
-        img.save(tmp.name, "PNG")
-        tmp_path = tmp.name
-    try:
-        async with sem:
+    # Encode inside the semaphore: asyncio.gather schedules every page's
+    # coroutine at once, and each runs synchronously up to its first real
+    # await. With the encode outside, all N pages of a window would PNG-encode
+    # to disk up front instead of `batch_size` at a time.
+    async with sem:
+        with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
+            img.save(tmp.name, "PNG")
+            tmp_path = tmp.name
+        try:
             try:
                 layout = await process_image_async(tmp_path)
             except Exception as exc:
@@ -215,8 +282,8 @@ async def _ocr_one_page_async(page_meta: dict, sem: asyncio.Semaphore) -> dict:
                 # contribute to the markdown/JSON/DOCX outputs.
                 log.warning("[ocr] page failed, returning empty layout: %s", exc)
                 layout = []
-    finally:
-        os.unlink(tmp_path)
+        finally:
+            os.unlink(tmp_path)
     page = {
         **page_meta,
         "original_image": img,
@@ -230,6 +297,134 @@ async def _ocr_pages_concurrently(pages_meta: List[dict], batch_size: int) -> Li
     sem = asyncio.Semaphore(max(1, batch_size))
     tasks = [_ocr_one_page_async(p, sem) for p in pages_meta]
     return await asyncio.gather(*tasks)
+
+
+def _release_page_rasters(pages: List[dict]) -> None:
+    """Drop each page's full-page raster once its crops have been taken.
+
+    Both keys must go: `original_image` is an alias of `page_meta["image"]`
+    (same PIL object), and every recovery module reads
+    `page.get("original_image") or page.get("image")`, so leaving either one
+    keeps the ~26 MB buffer alive. Crops made with .crop() own their own
+    buffers and stay valid after the parent is closed.
+    """
+    for page in pages:
+        img = page.pop("original_image", None)
+        page.pop("image", None)
+        if img is not None:
+            try:
+                img.close()
+            except Exception:  # pragma: no cover - defensive
+                pass
+
+
+async def _process_window(pages_meta: List[dict], batch_size: int,
+                          doc_id: _uuid.UUID, page_offset: int) -> List[dict]:
+    """OCR + recover + crop one window of pages, then free their rasters.
+
+    Runs the exact phase order the whole-document path used to run; every
+    recovery pass is per-page pure (no cross-page state), so windowing is
+    output-equivalent. Returns raster-free page dicts: layout entries,
+    markdown, geometry, and Picture crops.
+    """
+    pages = await _ocr_pages_concurrently(pages_meta, batch_size)
+
+    # Recover checkboxes Chandra dropped on standalone form blocks
+    # (transcribed the option labels as bare text, no <input>). Re-OCRs just
+    # the block crop where the boxes likely got lost. Independent of
+    # pictures and works on scanned pages, so it runs unconditionally here.
+    if REOCR_DROPPED_CHECKBOXES:
+        await recover_dropped_checkboxes(pages)
+
+    # Detect rotated content and stamp `rotation` so reconstruction can turn it
+    # back (a landscape table scanned onto a portrait sheet, rotated side
+    # labels). Chandra reports no orientation at all, so without this every
+    # rotated block renders upright with its text crushed against the wrong
+    # axis. Deliberately NOT gated on INCLUDE_PICTURES — rotation is a property
+    # of text and tables, and this must still run on picture-free documents.
+    # Needs the page raster for its table pass, so it sits before
+    # `_release_page_rasters` below.
+    await detect_rotation(pages)
+
+    # ONE table validator, replacing the separate rotated / collapsed re-OCR
+    # passes that used to sit here. Each of those triggered on a specific failure
+    # shape, and three of them cropped the same bbox — so a table that was both
+    # rotated and collapsed could cost three model calls, and the collapse
+    # trigger was already contained in the de-rotate guard. This measures table
+    # HEALTH instead (placeable cells, complete rows, degeneracy, truncation),
+    # re-OCRs only what is unhealthy — de-rotating the crop first when detection
+    # stamped an angle — and keeps whichever read scores better.
+    #
+    # The comparative score is the substantive change: the old guards required a
+    # re-read to beat the baseline on every axis while trusting a baseline known
+    # to be sideways, which declined all 8 repairs on the measured rotated
+    # subset, including `full 12->15` (three empty rows filled) rejected for
+    # having one fewer column.
+    #
+    # Not gated on INCLUDE_PICTURES (cell completeness is unrelated to pictures,
+    # and that flag defaults false), and must precede `_release_page_rasters`,
+    # which frees the raster it crops.
+    await validate_tables(pages)
+
+    # Recover Picture entries the VLM dropped from inside tables. Only
+    # runs for native PDFs (image inputs / scans have no embedded raster
+    # info to recover from) and only injects pictures whose PDF bbox
+    # sits inside an already-detected Table bbox.
+    if INCLUDE_PICTURES:
+        # First repair any table where Chandra dropped a row+image on the
+        # full-page pass (embedded rasters > <img> cells): re-OCR the table
+        # crop and swap in the fuller HTML. Runs BEFORE recovery so the
+        # recovered pictures map onto the corrected grid.
+        if REOCR_DROPPED_ROWS:
+            await recover_dropped_table_rows(pages)
+        recover_missing_pictures(pages)
+        # Recover photos Chandra emitted as bare <img alt> placeholders in
+        # table cells (scanned pages / image inputs have no embedded raster
+        # for recover_missing_pictures to find). Crops them from the page
+        # raster by content-blob detection down each image column.
+        recover_table_cell_pictures(pages)
+        # Recover the TEXT LABELS inside each recovered diagram (mermaid loses
+        # them) by re-OCRing the crop, so the boxes/diamonds/edge labels can
+        # be translated and overlaid in place instead of staying in the source
+        # language baked into the raster.
+        await recover_diagram_text(pages)
+
+    if not INCLUDE_PICTURES:
+        for page in pages:
+            kept = []
+            for e in page["layout_result"]:
+                if e.get("category") not in PICTURE_LABELS:
+                    kept.append(e)
+                elif e.get("source") == "diagram-recovered":
+                    # A Diagram we relabelled to Image for cropping: with
+                    # pictures off, revert to a Diagram text block so the
+                    # mermaid content still renders instead of vanishing.
+                    e["category"] = "Diagram"
+                    e.pop("image_obj", None)
+                    kept.append(e)
+                # else: a real picture — drop it (pictures are off).
+            page["layout_result"] = kept
+
+    if ATTRIBUTE_STYLES:
+        _attribute_styles(pages)
+
+    # Crop + upload pictures first so each entry carries image_url before
+    # the markdown serializer runs — that lets the markdown reference the
+    # stored crop (images/{filename}) instead of a static placeholder.
+    if INCLUDE_PICTURES:
+        # start_index keeps the page{N} filename prefix absolute across windows.
+        pages = process_pictures(pages, start_index=page_offset + 1)
+        pages = await _upload_picture_assets(doc_id, pages)
+
+    for page in pages:
+        page["markdown_content"] = layoutjson2md(page["layout_result"])
+
+    # Every consumer past this point (json_to_docx, multi-page table chaining,
+    # the JSON envelope) reads only layout entries and pre-extracted crops —
+    # verified: ocr_reconstruction touches `original_image` solely in
+    # picture.process_pictures, which already ran above.
+    _release_page_rasters(pages)
+    return pages
 
 
 def _attribute_styles(pages: List[dict]) -> None:
@@ -308,93 +503,59 @@ async def _run_pipeline(in_path: Path, source_bytes: bytes, original_name: str,
     ext = in_path.suffix.lower()
     doc_id = await storage.insert_document(original_name, ext, source_bytes, owner_id)
 
+    source: _PageSource | None = None
     try:
         await storage.update_document(doc_id, status="processing")
         t0 = time.perf_counter()
 
         scan_type = _detect_scan_type(in_path)
         batch_size = _batch_size_for(scan_type)
-        pages_meta = _pages_from_path(in_path)
-        log.info("[ocr] %s id=%s: %d page(s), type=%s, batch_size=%d",
-                 original_name, doc_id, len(pages_meta), scan_type, batch_size)
+        source = _open_page_source(in_path)
+        total_pages = source.count
+        if MAX_PAGES and total_pages > MAX_PAGES:
+            raise HTTPException(
+                413, f"Document has {total_pages} pages; limit is {MAX_PAGES}")
 
-        pages = await _ocr_pages_concurrently(pages_meta, batch_size)
+        window = max(PAGE_WINDOW, batch_size)
+        log.info("[ocr] %s id=%s: %d page(s), type=%s, batch_size=%d, window=%d",
+                 original_name, doc_id, total_pages, scan_type, batch_size, window)
 
-        # Recover checkboxes Chandra dropped on standalone form blocks
-        # (transcribed the option labels as bare text, no <input>). Re-OCRs just
-        # the block crop where the boxes likely got lost. Independent of
-        # pictures and works on scanned pages, so it runs unconditionally here.
-        if REOCR_DROPPED_CHECKBOXES:
-            await recover_dropped_checkboxes(pages)
-
-        # Recover Picture entries the VLM dropped from inside tables. Only
-        # runs for native PDFs (image inputs / scans have no embedded raster
-        # info to recover from) and only injects pictures whose PDF bbox
-        # sits inside an already-detected Table bbox.
-        if INCLUDE_PICTURES:
-            # First repair any table where Chandra dropped a row+image on the
-            # full-page pass (embedded rasters > <img> cells): re-OCR the table
-            # crop and swap in the fuller HTML. Runs BEFORE recovery so the
-            # recovered pictures map onto the corrected grid.
-            if REOCR_DROPPED_ROWS:
-                await recover_dropped_table_rows(pages)
-            recover_missing_pictures(pages)
-            # Recover photos Chandra emitted as bare <img alt> placeholders in
-            # table cells (scanned pages / image inputs have no embedded raster
-            # for recover_missing_pictures to find). Crops them from the page
-            # raster by content-blob detection down each image column.
-            recover_table_cell_pictures(pages)
-            # Recover the TEXT LABELS inside each recovered diagram (mermaid loses
-            # them) by re-OCRing the crop, so the boxes/diamonds/edge labels can
-            # be translated and overlaid in place instead of staying in the source
-            # language baked into the raster.
-            await recover_diagram_text(pages)
-
-        if not INCLUDE_PICTURES:
-            for page in pages:
-                kept = []
-                for e in page["layout_result"]:
-                    if e.get("category") not in PICTURE_LABELS:
-                        kept.append(e)
-                    elif e.get("source") == "diagram-recovered":
-                        # A Diagram we relabelled to Image for cropping: with
-                        # pictures off, revert to a Diagram text block so the
-                        # mermaid content still renders instead of vanishing.
-                        e["category"] = "Diagram"
-                        e.pop("image_obj", None)
-                        kept.append(e)
-                    # else: a real picture — drop it (pictures are off).
-                page["layout_result"] = kept
-
-        if ATTRIBUTE_STYLES:
-            _attribute_styles(pages)
-
-        # Crop + upload pictures first so each entry carries image_url before
-        # the markdown serializer runs — that lets the markdown reference the
-        # stored crop (images/{filename}) instead of a static placeholder.
-        if INCLUDE_PICTURES:
-            pages = process_pictures(pages)
-            pages = await _upload_picture_assets(doc_id, pages)
-
-        for page in pages:
-            page["markdown_content"] = layoutjson2md(page["original_image"], page["layout_result"])
+        # Render → OCR → recover → crop → free, one window at a time. Peak
+        # memory tracks the window, not the page count, so a 3000-page document
+        # costs the same as a 32-page one. What accumulates in `pages` is
+        # raster-free: layout entries, markdown, geometry, and Picture crops.
+        pages: List[dict] = []
+        for start in range(0, total_pages, window):
+            end = min(start + window, total_pages)
+            pages_meta = source.render(start, end)
+            pages.extend(
+                await _process_window(pages_meta, batch_size, doc_id, start))
+            log.info("[ocr] id=%s: window %d-%d done (%d/%d pages)",
+                     doc_id, start, end, len(pages), total_pages)
 
         md_text = "\n\n".join(p["markdown_content"] for p in pages)
-        layout_json = [_page_envelope_for_json(p) for p in pages]
         md_bytes = md_text.encode("utf-8")
+        del md_text
+        layout_json = [_page_envelope_for_json(p) for p in pages]
         json_bytes = _json.dumps(layout_json, indent=2, ensure_ascii=False).encode("utf-8")
 
         docx_buf = io.BytesIO()
         json_to_docx(pages, output_path=docx_buf)
         docx_bytes = docx_buf.getvalue()
+        del docx_buf
 
         md_key, json_key, docx_key = await asyncio.gather(
             storage.put_artifact(doc_id, "md",   md_bytes),
             storage.put_artifact(doc_id, "json", json_bytes),
             storage.put_artifact(doc_id, "docx", docx_bytes),
         )
+        del md_bytes, json_bytes, docx_bytes
 
         elapsed = round(time.perf_counter() - t0, 2)
+        # `layout` (JSONB) is deliberately not written: it duplicates the
+        # layout.json already in MinIO, costs another full serialization of the
+        # document at the pipeline's second memory peak, and no reader uses it
+        # — the list/detail routes strip the column right back off.
         await storage.update_document(
             doc_id,
             status="ok",
@@ -403,7 +564,6 @@ async def _run_pipeline(in_path: Path, source_bytes: bytes, original_name: str,
             markdown_key=md_key,
             json_key=json_key,
             docx_key=docx_key,
-            layout=layout_json,
             elapsed_sec=elapsed,
             error=None,
         )
@@ -419,6 +579,12 @@ async def _run_pipeline(in_path: Path, source_bytes: bytes, original_name: str,
     except Exception as exc:
         await storage.update_document(doc_id, status="error", error=str(exc))
         raise
+    finally:
+        # Safe only here: DOCX inputs render through an intermediate PDF that
+        # `pdf_source` points at, and the recovery passes re-open it by path
+        # mid-window, so it cannot be removed until the document is done.
+        if source is not None:
+            source.cleanup()
 
 
 # DOCX → PDF preview helper (LibreOffice)
@@ -491,7 +657,6 @@ async def ocr(file: UploadFile = File(...), identity: Identity = Depends(require
         log.exception("pipeline failed")
         raise HTTPException(500, f"Pipeline failed: {exc}")
     finally:
-        import shutil
         shutil.rmtree(work, ignore_errors=True)
 
 
@@ -508,27 +673,34 @@ async def ocr_batch(files: List[UploadFile] = File(...),
         raise HTTPException(400, "No files uploaded")
 
     # Read every upload body up-front (the request body is gone once the
-    # StreamingResponse starts).
+    # StreamingResponse starts) — but spool it straight to disk and keep only
+    # the path. Holding every file's bytes here would pin them for the whole
+    # batch (the event_stream closure captures `prepared`), on top of each
+    # document's own pipeline peak.
+    work_root = Path(tempfile.mkdtemp(prefix="ocr_batch_"))
     prepared: list[dict] = []
-    for upload in files:
+    for i, upload in enumerate(files):
         original = Path(upload.filename or "upload").name
         ext = Path(original).suffix.lower()
         if ext not in SUPPORTED_EXTS:
             prepared.append({"original_name": original, "ext": ext,
-                             "content": None,
+                             "path": None,
                              "early_error": f"Unsupported file type: {ext}"})
             continue
         content = await upload.read()
         if not content:
             prepared.append({"original_name": original, "ext": ext,
-                             "content": None, "early_error": "Empty upload"})
+                             "path": None, "early_error": "Empty upload"})
             continue
+        sub = work_root / f"item_{i}"
+        sub.mkdir(parents=True, exist_ok=True)
+        in_path = sub / (original or f"item_{i}{ext}")
+        in_path.write_bytes(content)
+        del content
         prepared.append({"original_name": original, "ext": ext,
-                         "content": content, "early_error": None})
+                         "path": in_path, "early_error": None})
 
     async def event_stream():
-        import shutil
-        work_root = Path(tempfile.mkdtemp(prefix="ocr_batch_"))
         t0 = time.perf_counter()
         try:
             items = [
@@ -548,14 +720,13 @@ async def ocr_batch(files: List[UploadFile] = File(...),
                     })
                     continue
 
-                sub = work_root / f"item_{i}"
-                sub.mkdir(parents=True, exist_ok=True)
-                in_path = sub / (p["original_name"] or f"item_{i}{p['ext']}")
-                in_path.write_bytes(p["content"])
-
+                in_path = p["path"]
                 try:
+                    # Read back one document's bytes at a time (insert_document
+                    # needs them for the MinIO source upload) so only the file
+                    # being processed is resident, not the whole batch.
                     row = await _run_pipeline(
-                        in_path, source_bytes=p["content"],
+                        in_path, source_bytes=in_path.read_bytes(),
                         original_name=p["original_name"],
                         owner_id=identity.id,
                     )

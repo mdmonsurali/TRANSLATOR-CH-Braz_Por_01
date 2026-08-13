@@ -17,6 +17,10 @@ TRANSLATE_CHUNK_ITEMS = int(os.getenv("TRANSLATE_CHUNK_ITEMS", "20"))
 TRANSLATE_CHUNK_BYTES = int(os.getenv("TRANSLATE_CHUNK_BYTES", "4000"))
 TRANSLATE_CONCURRENCY = int(os.getenv("TRANSLATE_CONCURRENCY", "2"))
 TRANSLATE_RETRY_ONCE = os.getenv("TRANSLATE_RETRY_ONCE", "true").lower() == "true"
+# Pages translated per group. Bounds every intermediate (units/sources/results/
+# flat/retry copies) to the window instead of the whole document, and gives the
+# pipeline a natural checkpoint boundary. 0 disables windowing.
+TRANSLATE_PAGE_WINDOW = int(os.getenv("TRANSLATE_PAGE_WINDOW", "25"))
 
 # Separator token injected between prose entries in a chunk so we can
 # detect when the LLM merges or splits entries (count mismatch → per-item retry).
@@ -401,13 +405,42 @@ async def _retry_residual_cjk(sources: List[str], flat: List[str],
     return len(targets), still
 
 
-async def translate_layout(layout: List[dict], target_lang: str = "pt-BR") -> dict:
-    """Translate every prose string, table cell, and formula label in
-    `layout`, in place.
+async def translate_layout(layout: List[dict], target_lang: str = "pt-BR",
+                           page_window: int = 0,
+                           on_progress: Optional[Callable] = None) -> dict:
+                           
+    if page_window and page_window > 0 and len(layout) > page_window:
+        return await _translate_layout_windowed(
+            layout, target_lang, page_window, on_progress)
+    return await _translate_layout_once(layout, target_lang)
 
-    Returns {"items_translated", "chunks", "failed"}. `layout` is mutated;
-    pass a copy if you need the original.
-    """
+
+async def _translate_layout_windowed(layout: List[dict], target_lang: str,
+                                     page_window: int,
+                                     on_progress: Optional[Callable]) -> dict:
+    """Run `_translate_layout_once` over successive page groups, accumulating
+    stats. Each group's intermediates are freed before the next one starts."""
+    totals = {"items_translated": 0, "chunks": 0, "failed": 0,
+              "retried": 0, "untranslated_cjk": 0}
+    total_pages = len(layout)
+
+    for start in range(0, total_pages, page_window):
+        group = layout[start:start + page_window]
+        stats = await _translate_layout_once(group, target_lang)
+        for k in totals:
+            totals[k] += int(stats.get(k, 0) or 0)
+
+        done = min(start + page_window, total_pages)
+        log.info("[translate] pages %d-%d done (%d/%d), %d item(s) so far",
+                 start, done, done, total_pages, totals["items_translated"])
+        if on_progress is not None:
+            await on_progress(done, total_pages, dict(totals))
+
+    return totals
+
+
+async def _translate_layout_once(layout: List[dict], target_lang: str) -> dict:
+    """Translate one batch of page envelopes in a single pass."""
     units, finalizers = _collect_units(layout)
     # Mask form-checkbox glyphs so the model preserves them verbatim (see
     # _mask_checkbox_glyphs). Restored on every result before write-back below.

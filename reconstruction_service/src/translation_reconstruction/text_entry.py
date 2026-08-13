@@ -57,7 +57,9 @@ def _downward_text_room_pt(ctx, entry: Dict, x1: float, x2: float,
 
 
 def render_text_entry(ctx, entry: Dict) -> None:
-    from .geometry import bbox_px_to_emu, EMU_PER_PT
+    from .geometry import (
+        bbox_px_to_emu, EMU_PER_PT, is_quarter_turn, normalize_rotation,
+    )
     from .ooxml import build_anchored_textbox_xml, build_paragraph_xml, build_run_xml
     from .text_fit import (
         get_font, has_cjk, wrap_to_width, fit_multiline, measure_width_px,
@@ -82,13 +84,21 @@ def render_text_entry(ctx, entry: Dict) -> None:
 
     x1, y1, x2, y2 = [float(v) for v in bbox]
     zoom = ctx.zoom
+    # Carried straight through from OCR (the translator preserves unknown entry
+    # keys), so a label detected as rotated stays rotated in the translation.
+    rotation = normalize_rotation(entry.get("rotation"))
 
     # Width-grow for short labels: if the text is a single logical line that
     # doesn't fit the source bbox width at its base size, widen the box to the
     # right (up to the page's right margin) so it fits WITHOUT wrapping — instead
     # of wrapping and growing height (which overlaps the content below). Only for
     # single-line labels; multi-line prose keeps its bbox and wraps as before.
-    if category in _WIDTH_GROW_CATEGORIES and "\n" not in text:
+    # Rotated entries are excluded: "widen to the right" grows the box ALONG
+    # the reading direction once the text is turned, and the obstacle logic
+    # below models neighbours in unrotated page space, so it would happily
+    # extend a vertical label across the drawing beside it.
+    if (category in _WIDTH_GROW_CATEGORIES and "\n" not in text
+            and not is_quarter_turn(rotation)):
         _base_pt = float(style.get("size") or 11.0)
         _want_bold = bool(style.get("bold")) or category in (
             "Title", "Section-header", "Section-Header", "Page-header",
@@ -136,7 +146,12 @@ def render_text_entry(ctx, entry: Dict) -> None:
     padded_y2 = min(y2 + _PAD_PX, ctx.page_h_pt * zoom)
     box_w_pt = max(1.0, (x2 - x1) / zoom)
     box_h_pt = max(1.0, (padded_y2 - y1) / zoom)
-    
+    # Quarter-turned text reads along the box's other axis — measure against the
+    # swapped pair. The shape stays unrotated (`bodyPr vert=` turns only the
+    # text), so its emitted geometry is unaffected.
+    if is_quarter_turn(rotation):
+        box_w_pt, box_h_pt = box_h_pt, box_w_pt
+
     base_size_pt = float(style.get("size") or 11.0)
     bold_render = bool(style.get("bold")) or category in (
         "Title", "Section-header", "Page-header", "Page-footer", "Caption",
@@ -172,7 +187,10 @@ def render_text_entry(ctx, entry: Dict) -> None:
     # e.g. long footers/titles the OCR gave a too-short bbox), keep the floor
     # size, wrap the FULL text, and GROW the box downward (spAutoFit) so every
     # line is visible. Fixed boundaries are still used for text that fits.
-    body_auto_fit = lines is None
+    # Downward growth is meaningless for turned text — the box would have to
+    # grow sideways, into the drawing beside it. Rotated overruns shrink to the
+    # readable floor instead (deliberate limitation).
+    body_auto_fit = lines is None and not is_quarter_turn(rotation)
     if lines is None:
         floor_pt = 6.0
         style["size"] = min(base_size_pt, floor_pt)
@@ -192,7 +210,12 @@ def render_text_entry(ctx, entry: Dict) -> None:
             # If growing down to `needed_h_pt` would overlap the neighbour below's
             # TEXT, try to fit within the available room by shrinking the font
             # (translator only — this whole renderer is the translator path).
-            if (_avail_h_down_pt is not None
+            if is_quarter_turn(rotation):
+                # Turned text: never touch `h` (the box's short side). The font
+                # already shrank to the floor during fitting; growing here would
+                # fatten the label across the drawing.
+                pass
+            elif (_avail_h_down_pt is not None
                     and needed_h_pt > _avail_h_down_pt > 0):
                 _fs2, _lines2 = fit_multiline(
                     text, box_w_pt, _avail_h_down_pt,
@@ -236,5 +259,6 @@ def render_text_entry(ctx, entry: Dict) -> None:
         build_anchored_textbox_xml(
             x, y, w, h, para_xml, ctx._next_id(),
             body_auto_fit=body_auto_fit,
+            rotation=rotation,
         )
     )

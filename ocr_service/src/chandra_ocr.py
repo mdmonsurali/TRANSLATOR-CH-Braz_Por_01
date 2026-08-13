@@ -1,24 +1,10 @@
-"""vLLM client + Chandra-OCR-2 document-parsing call.
-
-Talks to a stock `vllm/vllm-openai` server hosting `datalab-to/chandra-ocr-2`
-over the OpenAI-compatible API. Chandra emits **HTML**: a flat list of
-top-level `<div data-label="..." data-bbox="x0 y0 x1 y1">...</div>` blocks in
-reading order, where the bbox is normalized to a 0–1000 canvas. We parse that
-HTML into the layout-entry shape the downstream renderer expects
-(`chandra_style`, `picture_recovery`, `layoutjson2md`, `json_to_docx`), with
-bboxes rescaled to original-image pixels.
-
-Small helpers (`scale_to_fit`, the `ocr_layout` prompt, `detect_repeat_token`,
-the layout HTML parser) are ported from the Apache-2.0 `datalab-to/chandra`
-repo so this service does not depend on the full `chandra-ocr` package.
-"""
-
 import asyncio
 import base64
 import logging
 import os
 import re
 import tempfile
+from collections import Counter
 from typing import Tuple
 
 from bs4 import BeautifulSoup
@@ -43,6 +29,13 @@ MAX_OUTPUT_TOKENS = int(os.getenv("OCR_MAX_TOKENS", "12384"))
 
 # Repeat-token retry budget (replaces Unlimited-OCR's ngram logits processor).
 MAX_RETRIES = int(os.getenv("OCR_MAX_RETRIES", "6"))
+
+
+REPEAT_RETRY = os.getenv("OCR_REPEAT_RETRY", "false").strip().lower() in {
+    "1", "true", "yes", "on"}
+
+
+REQUEST_TIMEOUT_SEC = float(os.getenv("OCR_REQUEST_TIMEOUT_SEC", "300"))
 
 # ── Chandra ocr_layout prompt (ported from chandra/prompts.py) ───────────────
 
@@ -189,6 +182,31 @@ def scale_to_fit(
     return img.resize((new_width, new_height), resample=resample_method)
 
 
+_CELL_RE = re.compile(r"<t[dh]\b[^>]*>(.*?)</t[dh]>", re.IGNORECASE | re.DOTALL)
+_TAG_RE = re.compile(r"<[^>]+>")
+
+_MAX_SAME_CELL_FRAC = float(os.getenv("OCR_MAX_SAME_CELL_FRAC", "0.70"))
+_MIN_CELLS_FOR_CHECK = 60
+
+
+def _repeats_one_cell(html: str) -> bool:
+    """True when one value dominates a table's cells — a cell-level repeat loop.
+
+    `detect_repeat_token` is a pure STRING test over the tail, so it can miss (or
+    only marginally catch) this shape: the run-on is structured markup, and a
+    trailing `</tr></tbody></table>` breaks the exact-suffix match it needs. This
+    counts cell VALUES instead, which is what actually degenerated.
+    """
+    if not html or len(html) < 200:
+        return False
+    values = [_TAG_RE.sub("", m).strip().lower() for m in _CELL_RE.findall(html)]
+    values = [v for v in values if v]
+    if len(values) < _MIN_CELLS_FOR_CHECK:
+        return False
+    top = Counter(values).most_common(1)[0][1]
+    return top / len(values) > _MAX_SAME_CELL_FRAC
+
+
 def detect_repeat_token(
     predicted_tokens: str,
     base_max_repeats: int = 4,
@@ -302,11 +320,6 @@ def _list_group_to_text(html_fragment: str) -> str:
     UNLESS the item text already begins with its own marker (so we never double
     up on the baked-in case). Non-list content in the block is flattened normally."""
     soup = BeautifulSoup(_inline_math_to_dollars(html_fragment), "html.parser")
-    # Convert form checkboxes/radios to a Unicode box glyph BEFORE get_text()
-    # (which strips empty <input> tags, dropping both the box and its state).
-    # A List-Group can hold form options (e.g. "是否打扫: <input/>是 <input/>否"),
-    # so it needs the same conversion the Form/Text path does in
-    # `_html_block_to_text`; without it those checkboxes vanish from the JSON.
     for inp in soup.find_all("input"):
         itype = (inp.get("type") or "checkbox").lower().rstrip("/").strip()
         if itype in ("checkbox", "radio"):
@@ -352,11 +365,6 @@ def _html_block_to_text(html_fragment: str) -> str:
     separately in chandra_style by inspecting the same HTML."""
     frag = _inline_math_to_dollars(html_fragment)
     soup = BeautifulSoup(frag, "html.parser")
-    # Convert form checkboxes/radios to a Unicode box glyph BEFORE get_text(),
-    # which would otherwise strip the empty <input> tags and silently drop both
-    # the box and its checked/unchecked state. Chandra emits these on standalone
-    # Form/Text blocks (e.g. "是否合格： <input checked type=checkbox/>是 …") just
-    # as it does inside tables; without this they vanish from the JSON entirely.
     for inp in soup.find_all("input"):
         itype = (inp.get("type") or "checkbox").lower().rstrip("/").strip()
         if itype in ("checkbox", "radio"):
@@ -444,8 +452,7 @@ def parse_layout_html(html: str, orig_img: Image.Image) -> list[dict]:
     soup = BeautifulSoup(html, "html.parser")
     top_level = soup.find_all("div", recursive=False)
     if not top_level:
-        # Some responses wrap everything in a body/other container; fall back
-        # to every div with a data-label.
+
         top_level = [d for d in soup.find_all("div") if d.get("data-label")]
 
     entries: list[dict] = []
@@ -466,17 +473,10 @@ def parse_layout_html(html: str, orig_img: Image.Image) -> list[dict]:
             try:
                 entry["image_obj"] = orig_img.crop(tuple(bbox))
             except (ValueError, SystemError):
-                # Invalid crop geometry — keep the block as a caption-less
-                # placeholder rather than dropping it.
                 pass
             img_tag = BeautifulSoup(inner, "html.parser").find("img")
             entry["text"] = (img_tag.get("alt") if img_tag else "") or ""
         elif label in DIAGRAM_LABELS:
-            # The model renders diagrams as mermaid *text*, losing the original
-            # drawing. Crop the block's own bbox and keep the picture instead,
-            # relabelling to Image so it flows through the normal picture path
-            # (process_pictures → upload → placement). The mermaid text is kept
-            # as the entry text only as a fallback when the crop fails.
             entry["text"] = _html_block_to_text(inner)
             try:
                 entry["image_obj"] = orig_img.crop(tuple(bbox))
@@ -487,20 +487,11 @@ def parse_layout_html(html: str, orig_img: Image.Image) -> list[dict]:
                 # the mermaid content still renders through the text path.
                 pass
         elif label in TABLE_LABELS or _looks_like_table(inner):
-            # A Table block — or ANY block (commonly a misclassified `Form`)
-            # whose HTML actually contains a <table>. Chandra sometimes labels
-            # the very same checkbox/test table `Form` on one page and `Table`
-            # on the next; a `Form` gets flattened to plain text by the else
-            # branch, destroying the grid. Route both to the table renderer so
-            # the structure is reconstructed consistently.
             entry["category"] = "Table"
             entry["text"] = _prepare_table_html(inner)
         elif label in FORMULA_LABELS:
             entry["text"] = _katex_to_latex(inner)
         elif label in LIST_LABELS:
-            # Re-emit ordered/unordered list markers the model expressed as
-            # <ol>/<ul> structure (naive flattening would drop the a) b) c) /
-            # 1. 2. prefixes).
             entry["text"] = _list_group_to_text(inner)
             entry["_html"] = inner
         else:
@@ -511,8 +502,6 @@ def parse_layout_html(html: str, orig_img: Image.Image) -> list[dict]:
         entries.append(entry)
     return entries
 
-
-# ── vLLM calls ───────────────────────────────────────────────────────────────
 
 def _image_to_b64(img: Image.Image) -> str:
     import io
@@ -553,21 +542,50 @@ async def ocr_image_async(orig_img: Image.Image) -> list:
     for attempt in range(MAX_RETRIES + 1):
         temperature = min(0.2 * attempt, 0.8)
         top_p = 0.1 if attempt == 0 else 0.95
-        response = await client.chat.completions.create(
-            model=MODEL_NAME,
-            messages=messages,
-            temperature=temperature,
-            top_p=top_p,
-            max_tokens=MAX_OUTPUT_TOKENS,
-        )
+        try:
+            response = await client.chat.completions.create(
+                model=MODEL_NAME,
+                messages=messages,
+                temperature=temperature,
+                top_p=top_p,
+                max_tokens=MAX_OUTPUT_TOKENS,
+                timeout=REQUEST_TIMEOUT_SEC,
+            )
+        except Exception as exc:
+            log.warning("[ocr] request failed/timed out on attempt %d (%s); "
+                        "retrying", attempt + 1, type(exc).__name__)
+            raw = ""
+            continue
         raw = response.choices[0].message.content or ""
-        has_repeat = detect_repeat_token(raw) or (
-            len(raw) > 50 and detect_repeat_token(raw, cut_from_end=50)
-        )
-        if not has_repeat:
-            break
-        log.warning("[ocr] repeat-token loop detected, retrying (attempt %d)", attempt + 1)
 
+        finish = getattr(response.choices[0], "finish_reason", None)
+        truncated = finish == "length"
+        if truncated:
+            log.warning(
+                "[ocr] generation hit the %d-token output cap (finish_reason="
+                "length) — the tail of this page is TRUNCATED%s",
+                MAX_OUTPUT_TOKENS,
+                "; retrying" if (REPEAT_RETRY and attempt < MAX_RETRIES) else "",
+            )
+
+        if not REPEAT_RETRY:
+            break
+        has_repeat = (
+            detect_repeat_token(raw)
+            or (len(raw) > 50 and detect_repeat_token(raw, cut_from_end=50))
+            or _repeats_one_cell(raw)
+        )
+        if not has_repeat and not truncated:
+            break
+        if attempt >= MAX_RETRIES:
+            break
+        if has_repeat:
+            log.warning("[ocr] repeat-token loop detected, retrying (attempt %d)",
+                        attempt + 1)
+
+    if not raw:
+        log.error("[ocr] page produced no output after %d attempt(s); "
+                  "returning empty layout", MAX_RETRIES + 1)
     return parse_layout_html(raw, orig_img)
 
 
@@ -587,5 +605,6 @@ def process_image(image_path: str, vllm_url: str | None = None) -> list:
         temperature=0.0,
         top_p=0.1,
         max_tokens=MAX_OUTPUT_TOKENS,
+        timeout=REQUEST_TIMEOUT_SEC,
     )
     return parse_layout_html(response.choices[0].message.content or "", orig_img)

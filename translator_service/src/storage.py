@@ -104,11 +104,15 @@ def health_minio() -> None:
 ARTIFACT_KEY = {
     "translated_json": "translated.json",
     "translated_docx": "translated.docx",
+    # Partially-translated layout, rewritten every page-window so a long job
+    # can resume instead of restarting. Deleted once the translation is ok.
+    "checkpoint": "checkpoint.json",
 }
 ARTIFACT_CONTENT_TYPE = {
     "translated_json": "application/json",
     "translated_docx":
         "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    "checkpoint": "application/json",
 }
 
 
@@ -177,6 +181,8 @@ async def insert_translation(original_name: str, source_document_id: _uuid.UUID,
 _ALLOWED_UPDATE_COLS = {
     "status", "translated_json_key", "translated_docx_key",
     "elapsed_sec", "error", "source_document_id",
+    # Checkpointing for long documents — see schema.sql.
+    "pages_done", "page_count", "checkpoint_key",
 }
 
 
@@ -376,6 +382,51 @@ async def fetch_ocr_image(doc_id: _uuid.UUID, filename: str) -> bytes:
     """Read a Picture PNG from MinIO. Caller verifies ownership."""
     key = _ocr_image_object_name(doc_id, filename)
     return await asyncio.to_thread(_get_object_bytes, key)
+
+
+# ── Checkpointing (long translations) ────────────────────────────────────────
+
+async def put_checkpoint(trans_id: _uuid.UUID, layout: list[dict]) -> str:
+    """Persist the partially-translated layout so the job can resume.
+
+    Written every page-window, so it must stay cheap relative to a window's
+    translation cost — for a 25-page window that is many model calls, so one
+    JSON serialization is noise.
+    """
+    import json as _j
+    body = _j.dumps(layout, ensure_ascii=False).encode("utf-8")
+    return await put_translated_artifact(trans_id, "checkpoint", body)
+
+
+async def fetch_checkpoint(trans_id: _uuid.UUID) -> Optional[list[dict]]:
+    """Read a partially-translated layout back, or None if unusable.
+
+    Never raises: a missing or corrupt checkpoint must degrade to "start over",
+    never to a failed translation.
+    """
+    import json as _j
+    key = _artifact_object_name(trans_id, "checkpoint")
+    try:
+        body = await asyncio.to_thread(_get_object_bytes, key)
+        obj = _j.loads(body.decode("utf-8"))
+    except Exception as exc:
+        log.warning("checkpoint unreadable for %s (%s); starting over",
+                    trans_id, exc)
+        return None
+    if not isinstance(obj, list):
+        log.warning("unexpected checkpoint shape for %s: %s; starting over",
+                    trans_id, type(obj))
+        return None
+    return obj
+
+
+async def delete_checkpoint(trans_id: _uuid.UUID) -> None:
+    """Drop the checkpoint once the translation has completed."""
+    key = _artifact_object_name(trans_id, "checkpoint")
+    try:
+        await asyncio.to_thread(minio.remove_object, MINIO_BUCKET, key)
+    except Exception as exc:  # best-effort cleanup
+        log.warning("could not delete checkpoint %s: %s", key, exc)
 
 
 async def get_artifact_bytes(trans_id: _uuid.UUID, kind: str

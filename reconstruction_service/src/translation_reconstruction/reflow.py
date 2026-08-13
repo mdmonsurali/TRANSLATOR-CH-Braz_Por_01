@@ -345,6 +345,13 @@ def reflow_page_entries(
     for i, entry in enumerate(cascade_entries):
         if entry.get("category") not in _CASCADE_CATEGORIES:
             continue  # Pictures/Tables/Formulas: passive — they shift but don't expand
+        # Rotated entries are passive too: every measurement below
+        # (_needed_height_px, the width-first fit, the downward cascade) assumes
+        # text flows left-to-right and grows downward. For turned text those
+        # axes are swapped, so expanding here would grow the box across its own
+        # reading direction.
+        if float(entry.get("rotation") or 0.0):
+            continue
 
         x1, y1, x2, y2 = [float(v) for v in entry["bbox"]]
         cur_h = y2 - y1

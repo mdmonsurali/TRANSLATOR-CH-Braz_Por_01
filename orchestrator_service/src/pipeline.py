@@ -29,8 +29,13 @@ TRANSLATOR_SERVICE_URL = os.environ.get(
     "TRANSLATOR_SERVICE_URL", "http://translator_service:8003",
 )
 TRANSLATE_TARGET_LANG = os.environ.get("TRANSLATE_TARGET_LANG", "pt-BR")
-OCR_TIMEOUT_SEC = float(os.environ.get("OCR_TIMEOUT_SEC", "900"))
-TRANSLATE_TIMEOUT_SEC = float(os.environ.get("TRANSLATE_TIMEOUT_SEC", "1800"))
+# Whole-document calls: these must cover the ENTIRE job, not one page. A
+# 1000-page OCR pass or translation runs for hours, and the old 15/30-minute
+# defaults aborted such jobs long before memory was ever the limit. Translation
+# checkpoints every TRANSLATE_PAGE_WINDOW pages, so a timeout here now costs at
+# most one window of re-work rather than the whole document.
+OCR_TIMEOUT_SEC = float(os.environ.get("OCR_TIMEOUT_SEC", "21600"))        # 6h
+TRANSLATE_TIMEOUT_SEC = float(os.environ.get("TRANSLATE_TIMEOUT_SEC", "43200"))  # 12h
 
 SUPPORTED_EXTS = {".pdf", ".docx", ".jpg", ".jpeg", ".png"}
 

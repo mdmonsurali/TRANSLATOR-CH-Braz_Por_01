@@ -126,7 +126,9 @@ def render_diagram_label_overlays(ctx, diagram_entry: Dict,
     if not label_entries:
         return
 
-    from .geometry import bbox_px_to_emu, EMU_PER_PT
+    from .geometry import (
+        bbox_px_to_emu, EMU_PER_PT, is_quarter_turn, normalize_rotation,
+    )
     from .ooxml import (
         build_anchored_textbox_xml, build_paragraph_xml, build_run_xml,
     )
@@ -155,6 +157,12 @@ def render_diagram_label_overlays(ctx, diagram_entry: Dict,
         # made to fit by SHRINKING the font instead (down to a small floor).
         box_w_pt = max(1.0, (x2 - x1) / zoom)
         box_h_pt = max(1.0, (y2 - y1) / zoom)
+        # A turned label reads along the box's long axis, so measure against the
+        # swapped pair. Without this the fitter wraps across the narrow side and
+        # collapses to the font floor — the 5.5pt broken-word symptom.
+        _rot = normalize_rotation(region.get("rotation"))
+        if is_quarter_turn(_rot):
+            box_w_pt, box_h_pt = box_h_pt, box_w_pt
         style = dict(region.get("style") or {})
         base_size_pt = float(style.get("size") or 11.0)
         bold_render = bool(style.get("bold"))
@@ -187,5 +195,6 @@ def render_diagram_label_overlays(ctx, diagram_entry: Dict,
             build_anchored_textbox_xml(
                 x, y, bw, bh, para_xml, ctx._next_id(),
                 body_auto_fit=body_auto_fit, fill_rgb="FFFFFF",
+                rotation=_rot,
             )
         )

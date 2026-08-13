@@ -8,12 +8,16 @@ honours colspan/rowspan, then OOXML emission with:
 """
 from __future__ import annotations
 
+import logging
 import re
 from html.parser import HTMLParser
 from io import BytesIO
 from typing import Dict, List, Optional, Tuple
 
-from .geometry import EMU_PER_PT, bbox_px_to_emu
+from .geometry import (
+    EMU_PER_PT, bbox_px_to_emu, is_quarter_turn, normalize_rotation,
+    rotated_shape_geometry,
+)
 from .ooxml import (
     NS_W,
     build_anchored_textbox_xml, build_paragraph_xml, build_run_xml,
@@ -154,6 +158,11 @@ class TableHTMLParser(HTMLParser):
 # table seen in these documents.
 MAX_TABLE_ROWS = 200
 MAX_TABLE_COLS = 40
+
+log = logging.getLogger("ocr_reconstruction.table")
+
+
+
 
 
 def _cell_parts(cell) -> Tuple[str, int, int, int]:
@@ -648,6 +657,20 @@ def parse_table_grid(
     # Modal width, but never below the real-content extent, never above the cap.
     modal = Counter(widths).most_common(1)[0][0] if widths else 1
     max_cols = max(1, min(raw_max, max(modal, content_extent)))
+
+    # Report cells this grid CANNOT hold. A row wider than `max_cols` has its
+    # overflow silently dropped, and that used to happen with no diagnostic at
+    # all: one measured page whose 12 data rows ran together into a single
+    # 701-cell row placed just 67 of 728 cells. The OCR side repairs this shape
+    # (`table_validate`, which measures placeable cells); this log is what makes
+    # a leak visible if any slips through.
+    overflow = sum(max(0, w - max_cols) for w in widths)
+    if overflow:
+        log.warning(
+            "[table] grid is %d cols but the widest row has %d cells — "
+            "DROPPING %d cell(s) that cannot be placed",
+            max_cols, max(widths, default=0), overflow,
+        )
 
     cell_anchors, occupied, _, img_by_anchor = _place(max_cols)
     _merge_duplicate_rowspan_labels(cell_anchors, occupied, max_cols, n_rows)
@@ -1495,6 +1518,31 @@ def _split_multi_picture_image_cells(
             r += span_i
 
 
+
+def _cell_text_direction(cell_rotations, row_idx: int, col_idx: int):
+    """OOXML `w:textDirection` value for a cell, or None when upright.
+
+    `cell_rotations` maps "row,col" -> degrees CCW-positive, carried on the
+    Table entry so the (text, colspan, rowspan) cell tuple — which threads
+    through every width/height balancer — stays untouched.
+
+    btLr reads bottom-to-top (the usual rotated-header look); tbRl reads
+    top-to-bottom.
+    """
+    if not cell_rotations:
+        return None
+    try:
+        rot = float(cell_rotations.get("%d,%d" % (row_idx, col_idx)) or 0.0)
+    except (AttributeError, TypeError, ValueError):
+        return None
+    rot %= 360.0
+    if abs(rot - 90.0) <= 5.0:
+        return "btLr"
+    if abs(rot - 270.0) <= 5.0:
+        return "tbRl"
+    return None
+
+
 def render_table(
     ctx,
     entry: Dict,
@@ -1506,9 +1554,23 @@ def render_table(
     bbox = entry.get("bbox")
     if not bbox or len(bbox) != 4:
         return
-    x, y, w, h = bbox_px_to_emu(
-        bbox, ctx.zoom, ctx.page_w_pt, ctx.page_h_pt,
-    )
+    # Rotation, in two independent flavours:
+    #   * `cell_rotations` {"row,col": deg} turns individual cells' text while
+    #     the grid stays upright (rotated headers) — Case A.
+    #   * `rotation` on the entry itself turns the WHOLE table, container and
+    #     all (a landscape table on a portrait page) — Case B.
+    cell_rotations = entry.get("cell_rotations") or {}
+    table_rotation = normalize_rotation(entry.get("rotation"))
+    if is_quarter_turn(table_rotation):
+        # The grid is built in transposed space and the container is spun, so
+        # the shape's unrotated extent is the bbox with axes swapped.
+        x, y, w, h = rotated_shape_geometry(
+            bbox, table_rotation, ctx.zoom, ctx.page_w_pt, ctx.page_h_pt,
+        )
+    else:
+        x, y, w, h = bbox_px_to_emu(
+            bbox, ctx.zoom, ctx.page_w_pt, ctx.page_h_pt,
+        )
 
     # Parse table cells (HTML preferred; markdown fallback). Cells carry
     # (text, colspan, rowspan) so we can honour merged headers.
@@ -1565,6 +1627,10 @@ def render_table(
             build_anchored_textbox_xml(
                 x, y, w, h, para_xml, ctx._next_id(),
                 body_auto_fit=True,
+                rotation=table_rotation,
+                # `x/y/w/h` came from rotated_shape_geometry when turned, which
+                # is the transposed extent the shape-rotating path expects.
+                rotate_shape=True,
             )
         )
         return
@@ -2194,6 +2260,13 @@ def render_table(
                     tc_pr_parts.append(f'<w:gridSpan w:val="{cs}"/>')
                 if rs > 1:
                     tc_pr_parts.append('<w:vMerge w:val="restart"/>')
+                # Rotated cell content (e.g. turned headers over narrow
+                # columns). MUST sit after gridSpan/vMerge and before vAlign —
+                # w:tcPr is a sequence type, and the wrong order still opens in
+                # LibreOffice but is rejected by Word.
+                _td = _cell_text_direction(cell_rotations, row_idx, col_idx)
+                if _td:
+                    tc_pr_parts.append(f'<w:textDirection w:val="{_td}"/>')
                 tc_pr_parts.append('<w:vAlign w:val="center"/>')
                 cells_xml.append(
                     "<w:tc>"
@@ -2279,17 +2352,48 @@ def render_table(
     # full text already fits inside these fixed rows, so `hRule="exact"` clips
     # nothing.
     rows_total_emu = int(round(sum(row_h_pts) * EMU_PER_PT))
+    # Safe for a rotated table too: `h` was the TRANSPOSED extent (from
+    # rotated_shape_geometry) that the grid was laid out against, and the
+    # fitting loop kept the row-height sum equal to it, so re-deriving `h` here
+    # reproduces the same transposed value rather than reverting to the bbox.
     h = rows_total_emu
     ctx.xml_chunks.append(
         build_anchored_textbox_xml(
             x, y, w, h, body_xml, ctx._next_id(),
             body_auto_fit=False,
+            # Case B: spins the whole container (grid included). No-op at 0.
+            # `rotate_shape` is required — `bodyPr vert=` would only reflow the
+            # text inside each cell and leave the grid itself upright.
+            rotation=table_rotation,
+            rotate_shape=True,
         )
     )
 
     # Render the non-table content (checkboxes, review paragraphs, signatures)
-    # in the vertical band reserved for it, directly beneath the table.
+    # in the band reserved for it, directly beneath the table.
     if trailing_text and trailing_h_emu > 0:
-        _emit_trailing_text_block(
-            ctx, trailing_text, x, y + h, w, trailing_h_emu, trailing_style,
-        )
+        if is_quarter_turn(table_rotation):
+            # "Beneath" is in the TABLE's frame, not the page's. The container is
+            # spun about its centre, so its on-page footprint is the transposed
+            # rectangle: the band below the table's last row lies to the LEFT of
+            # that footprint at 90° (and to the RIGHT at 270°), running the full
+            # footprint height. Keep the block's own text upright — it is prose,
+            # and matching the table's turn here would need a second rotated
+            # measurement pass for no reader benefit.
+            cx = x + w // 2
+            cy = y + h // 2
+            foot_w, foot_h = h, w          # footprint = transposed extent
+            foot_x = cx - foot_w // 2
+            foot_y = cy - foot_h // 2
+            if normalize_rotation(table_rotation) == 90.0:
+                t_x = max(0, foot_x - trailing_h_emu)
+            else:
+                t_x = foot_x + foot_w
+            _emit_trailing_text_block(
+                ctx, trailing_text, t_x, foot_y, trailing_h_emu, foot_h,
+                trailing_style,
+            )
+        else:
+            _emit_trailing_text_block(
+                ctx, trailing_text, x, y + h, w, trailing_h_emu, trailing_style,
+            )

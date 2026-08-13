@@ -88,6 +88,101 @@ def alignment_for_bbox(bbox, page_w_pt: float, zoom: float) -> str:
     return "center"
 
 
+# ── Rotation ────────────────────────────────────────────────────────────────
+# Layout entries may carry an optional `rotation`: FLOAT DEGREES,
+# COUNTER-CLOCKWISE-POSITIVE, where absent/0 means upright. The CJK side-labels
+# that motivated this (glyphs turned 90° clockwise, reading bottom-to-top) are
+# `rotation = 90.0`. Every reader must go through `normalize_rotation` so a
+# missing key, None, a string, and 0 all collapse to the same upright no-op.
+
+# Detections land near-but-not-exactly on a quarter turn (measured: -0.73°,
+# and real scans give 89.2/90.4). Snapping inside this tolerance is what lets
+# the common case use the cheap `bodyPr vert=` renderer — which preserves the
+# box geometry — instead of the shape-rotating `a:xfrm rot=` path.
+ROTATION_SNAP_TOLERANCE_DEG = 5.0
+
+
+def normalize_rotation(value) -> float:
+    """Coerce `value` to degrees in [0, 360), snapping near-quarter-turns.
+
+    Returns 0.0 for None/""/non-numeric, so `entry.get("rotation")` on an
+    upright (or pre-rotation-feature) entry is always safe.
+    """
+    try:
+        deg = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    if deg != deg or deg in (float("inf"), float("-inf")):  # NaN / inf
+        return 0.0
+    deg %= 360.0
+    for quarter in (0.0, 90.0, 180.0, 270.0, 360.0):
+        if abs(deg - quarter) <= ROTATION_SNAP_TOLERANCE_DEG:
+            return quarter % 360.0
+    return deg
+
+
+def is_quarter_turn(rotation) -> bool:
+    """True for exactly 90°/270° — the orientations `bodyPr vert=` can express.
+
+    180° is deliberately excluded: there is no `vert` value for it, so it takes
+    the `a:xfrm rot=` path along with arbitrary angles.
+    """
+    return normalize_rotation(rotation) in (90.0, 270.0)
+
+
+def is_upright(rotation) -> bool:
+    """True when no rotation handling is needed at all (the default path)."""
+    return normalize_rotation(rotation) == 0.0
+
+
+def rotated_shape_geometry(bbox_px, rotation, zoom: float,
+                           page_w_pt: float, page_h_pt: float):
+    """EMU position+extent for a shape rotated by `rotation` about its centre.
+
+    `a:xfrm rot=` spins the shape around its own centre, and Word/LibreOffice
+    read `wp:extent` as the UNROTATED extent. So to make a rotated shape cover
+    the source bbox we emit the transposed extent and shift the anchor by half
+    the difference — otherwise a tall-narrow label lands rotated but offset by
+    (w-h)/2 in both axes.
+
+    Upright and 180° rotations need no transposition and fall through to plain
+    `bbox_px_to_emu`. Clamping happens against the shape's real on-page
+    footprint, which for a quarter turn is the transposed rectangle.
+    """
+    rot = normalize_rotation(rotation)
+    if not is_quarter_turn(rot):
+        return bbox_px_to_emu(bbox_px, zoom, page_w_pt, page_h_pt)
+
+    x1, y1, x2, y2 = bbox_px
+    x_pt = max(0.0, x1 / zoom)
+    y_pt = max(0.0, y1 / zoom)
+    w_pt = max(1.0, (x2 - x1) / zoom)
+    h_pt = max(1.0, (y2 - y1) / zoom)
+
+    # Centre is rotation-invariant; rebuild the unrotated (transposed) box around it.
+    cx_pt = x_pt + w_pt / 2.0
+    cy_pt = y_pt + h_pt / 2.0
+    rw_pt, rh_pt = h_pt, w_pt
+    rx_pt = cx_pt - rw_pt / 2.0
+    ry_pt = cy_pt - rh_pt / 2.0
+
+    # Clamp the FOOTPRINT (the original w/h box), then re-derive the offset so
+    # the shape stays centred on the same point.
+    if x_pt + w_pt > page_w_pt:
+        cx_pt = min(cx_pt, max(w_pt / 2.0, page_w_pt - w_pt / 2.0))
+    if y_pt + h_pt > page_h_pt:
+        cy_pt = min(cy_pt, max(h_pt / 2.0, page_h_pt - h_pt / 2.0))
+    rx_pt = cx_pt - rw_pt / 2.0
+    ry_pt = cy_pt - rh_pt / 2.0
+
+    return (
+        int(round(rx_pt * EMU_PER_PT)),
+        int(round(ry_pt * EMU_PER_PT)),
+        int(round(rw_pt * EMU_PER_PT)),
+        int(round(rh_pt * EMU_PER_PT)),
+    )
+
+
 def bbox_px_to_emu(bbox_px, zoom: float, page_w_pt: float, page_h_pt: float):
     """Convert a 2x-pixel bbox to EMU position+extent, clamped to the page."""
     x1, y1, x2, y2 = bbox_px

@@ -1,6 +1,6 @@
 # database/
 
-PostgreSQL data model and SQL files for TRANSLATOR-CH-Braz_Por.
+PostgreSQL data model and SQL files for TRANSLATOR-CH-Braz_Por_01.
 
 ## Data model
 

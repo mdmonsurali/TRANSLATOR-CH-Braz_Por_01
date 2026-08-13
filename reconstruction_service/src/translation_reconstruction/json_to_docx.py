@@ -11,7 +11,7 @@ from docx import Document
 from docx.shared import Pt, RGBColor
 
 from .geometry import (
-    add_section_for_page, normalize_page,
+    add_section_for_page, normalize_page, normalize_rotation,
 )
 from .picture import render_standalone_picture
 from .table import (
@@ -22,6 +22,11 @@ from .formula import render_formula
 from .text_entry import render_text_entry
 from .shape_context import ShapeContext
 from .reflow import layout_page
+
+
+# How far below the page-header band (pt, scaled by zoom) a table may start and
+# still count as "at the top of the page" for continuation-chain detection.
+_TABLE_AT_TOP_PT = 60.0
 
 
 # ─── Style normalisation ────────────────────────────────────────────────
@@ -145,12 +150,19 @@ def _link_table_continuations(layout_results) -> None:
             ent["_shared_col_weights"] = list(weights)
 
     for raw_page in layout_results:
+        page_zoom = 1.0
         if isinstance(raw_page, dict):
             entries = (
                 raw_page.get("entries")
                 or raw_page.get("layout_result")
                 or []
             )
+            # Bboxes are in page PIXELS; the at-top threshold below is in
+            # points, so it has to be scaled by this page's zoom.
+            try:
+                page_zoom = float(raw_page.get("zoom") or 1.0) or 1.0
+            except (TypeError, ValueError):
+                page_zoom = 1.0
         elif isinstance(raw_page, list):
             entries = raw_page
         else:
@@ -185,7 +197,14 @@ def _link_table_continuations(layout_results) -> None:
 
             bbox = entry.get("bbox") or [0, 0, 0, 0]
             tbl_top = bbox[1] if len(bbox) >= 2 else 0
-            at_top_of_page = (tbl_top - page_header_y2) <= 60
+            # `tbl_top`/`page_header_y2` are PIXELS, so the point threshold has
+            # to be scaled by zoom. Comparing points against pixels made this
+            # test fail on every page of a 4x-zoom scan (a table 42pt from the
+            # top measures 175px), so no chain ever linked and continuation
+            # pages each computed their own column widths.
+            at_top_of_page = (
+                (tbl_top - page_header_y2) <= _TABLE_AT_TOP_PT * page_zoom
+            )
 
             is_continuation = (
                 chain_parent_entry is not None
@@ -213,6 +232,105 @@ def _link_table_continuations(layout_results) -> None:
     _finalize_chain()
 
 
+# Fraction of a page's rotated area that makes the WHOLE PAGE rotated (a
+# landscape sheet scanned into a portrait frame) rather than a few turned
+# labels sitting on an upright page.
+_PAGE_ROT_AREA_RATIO = 0.5
+
+
+def _derotate_rotated_pages(layout_results) -> None:
+    """Turn a page whose CONTENT is rotated into an upright LANDSCAPE page.
+
+    WHY THIS INSTEAD OF ROTATING THE SHAPES. A quarter-turned table cannot be
+    expressed by rotating its container: `bodyPr vert=` only reflows text inside
+    the cells and leaves the grid upright, and while `a:xfrm rot=` is the right
+    OOXML in principle, renderers ignore it on a shape that holds a `<w:tbl>`.
+    Measured on the rendered output of this very document: 255 table cells came
+    back at text direction (1,0) — dead upright — while only the 5 standalone
+    labels (which use `vert=`) actually turned. So the shape-rotation path
+    cannot deliver a rotated table in practice.
+
+    What DOES work is to stop fighting the renderer: swap the section's page
+    width/height so the page itself is landscape, map every bbox through the
+    inverse rotation, and render all content UPRIGHT. That is plain,
+    universally-supported OOXML — no renderer can quietly drop it — and it has
+    the side benefit that the result is normal editable/translatable text
+    rather than a spun shape.
+
+    A page is de-rotated only when rotated entries dominate its content area
+    (`_PAGE_ROT_AREA_RATIO`); a couple of turned side-labels on an otherwise
+    upright page keep their per-entry `vert=` rendering instead.
+    """
+    for raw_page in layout_results:
+        if not isinstance(raw_page, dict):
+            continue
+        entries = raw_page.get("entries") or raw_page.get("layout_result") or []
+        if not entries:
+            continue
+
+        rot_area = 0.0
+        total_area = 0.0
+        angles = []
+        for e in entries:
+            bb = e.get("bbox")
+            if not bb or len(bb) != 4:
+                continue
+            try:
+                x1, y1, x2, y2 = (float(v) for v in bb)
+            except (TypeError, ValueError):
+                continue
+            a = max(0.0, x2 - x1) * max(0.0, y2 - y1)
+            total_area += a
+            rot = normalize_rotation(e.get("rotation"))
+            if rot in (90.0, 270.0):
+                rot_area += a
+                angles.append(rot)
+        if total_area <= 0 or not angles:
+            continue
+        if (rot_area / total_area) < _PAGE_ROT_AREA_RATIO:
+            continue
+
+        # One angle for the page: whichever turned orientation covers more area.
+        page_rot = max(set(angles), key=angles.count)
+
+        try:
+            w_pt = float(raw_page.get("page_width_pt"))
+            h_pt = float(raw_page.get("page_height_pt"))
+            zoom = float(raw_page.get("zoom") or 1.0) or 1.0
+        except (TypeError, ValueError):
+            continue
+
+        pw = w_pt * zoom          # page extent in PIXELS (bbox space)
+        ph = h_pt * zoom
+
+        def _map(bbox):
+            x1, y1, x2, y2 = (float(v) for v in bbox)
+            if page_rot == 90.0:
+                # Content reads bottom-to-top: (x, y) -> (y, pw - x).
+                return [y1, pw - x2, y2, pw - x1]
+            # 270°: content reads top-to-bottom: (x, y) -> (ph - y, x).
+            return [ph - y2, x1, ph - y1, x2]
+
+        for e in entries:
+            bb = e.get("bbox")
+            if bb and len(bb) == 4:
+                e["bbox"] = _map(bb)
+            # The page carries the rotation now, so every entry renders upright.
+            # Drop it rather than leaving a stale angle for the renderers.
+            if normalize_rotation(e.get("rotation")) in (90.0, 270.0):
+                e.pop("rotation", None)
+                e["derotated_with_page"] = True
+            # Any per-cell turn was relative to the old frame; it no longer
+            # applies once the page itself is straightened.
+            e.pop("cell_rotations", None)
+
+        # The section becomes landscape (or back to portrait for a turned
+        # landscape original) — a quarter turn always swaps the axes.
+        raw_page["page_width_pt"] = h_pt
+        raw_page["page_height_pt"] = w_pt
+        raw_page["page_rotation_applied"] = page_rot
+
+
 def json_to_docx(layout_results, output_path="output.docx"):
     """Build a DOCX whose page count, page size, and per-entry positions
     match the source document.
@@ -234,6 +352,12 @@ def json_to_docx(layout_results, output_path="output.docx"):
     pf.line_spacing = 1.0
 
     shape_counter = 1000  # docPr ids must be unique and >0
+
+    # Straighten any page whose content is rotated BEFORE anything measures it:
+    # the section becomes landscape and every bbox is mapped into that frame, so
+    # style normalisation, reflow and the renderers below all see ordinary
+    # upright geometry.
+    _derotate_rotated_pages(layout_results)
 
     _normalize_entry_styles(layout_results)
 

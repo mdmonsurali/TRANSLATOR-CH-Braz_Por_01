@@ -13,24 +13,29 @@ PDF_RENDER_ZOOM = PDF_RENDER_DPI / 72.0
 IMAGE_INPUT_DPI = 96  # treat raw image inputs as if rendered at 96 DPI for page sizing
 
 
-def load_pages_from_pdf(pdf_path: str) -> List[Dict]:
-    """Render each PDF page to a PIL image and capture its original geometry.
+def page_count_for_pdf(pdf_path: str) -> int:
+    """Page count without rendering anything."""
+    with fitz.open(pdf_path) as pdf_document:
+        return len(pdf_document)
 
-    Returns one dict per page:
-        {
-          "image":          PIL.Image (RGB, rendered at PDF_RENDER_ZOOM),
-          "page_width_pt":  float,   # original PDF page width in points
-          "page_height_pt": float,
-          "zoom":           float,   # rasterization zoom (image px = pt * zoom)
-          "page_index":     int,
-          "pdf_source":     str,     # absolute path, used later for font extraction
-        }
+
+def load_page_range(pdf_path: str, start: int, end: int) -> List[Dict]:
+    """Render PDF pages [start, end) only — the windowed form of
+    `load_pages_from_pdf`.
+
+    Page dicts are identical in shape to `load_pages_from_pdf`, and
+    `page_index` stays ABSOLUTE (not window-relative): picture_recovery and
+    table_reocr re-open `pdf_source` and index into it by that number, so
+    renumbering per window would silently read the wrong page.
     """
     pages: List[Dict] = []
     pdf_document = fitz.open(pdf_path)
     try:
+        total = len(pdf_document)
+        start = max(0, start)
+        end = min(end, total)
         mat = fitz.Matrix(PDF_RENDER_ZOOM, PDF_RENDER_ZOOM)
-        for page_num in range(len(pdf_document)):
+        for page_num in range(start, end):
             page = pdf_document.load_page(page_num)
             pix = page.get_pixmap(matrix=mat)
             image = Image.open(BytesIO(pix.tobytes("ppm"))).convert("RGB")
@@ -47,12 +52,32 @@ def load_pages_from_pdf(pdf_path: str) -> List[Dict]:
     return pages
 
 
-def load_pages_from_docx(docx_path: str) -> List[Dict]:
-    """Convert DOCX → PDF via LibreOffice, then load pages with geometry.
+def load_pages_from_pdf(pdf_path: str) -> List[Dict]:
+    """Render every PDF page to a PIL image and capture its original geometry.
 
-    The intermediate PDF is materialized to a stable cache path inside the
-    system temp directory so that subsequent font-extraction calls
-    (extract_font_spans) can re-open it. Caller is responsible for cleanup.
+    Returns one dict per page:
+        {
+          "image":          PIL.Image (RGB, rendered at PDF_RENDER_ZOOM),
+          "page_width_pt":  float,   # original PDF page width in points
+          "page_height_pt": float,
+          "zoom":           float,   # rasterization zoom (image px = pt * zoom)
+          "page_index":     int,
+          "pdf_source":     str,     # absolute path, used later for font extraction
+        }
+
+    Holds every page in memory at once. The OCR pipeline uses `load_page_range`
+    instead; this remains for callers that genuinely want the whole document.
+    """
+    return load_page_range(pdf_path, 0, page_count_for_pdf(pdf_path))
+
+
+def docx_to_pdf(docx_path: str) -> Tuple[str, str]:
+    """Convert DOCX → PDF via LibreOffice.
+
+    Returns (pdf_path, temp_dir). The PDF must outlive page rendering because
+    extract_font_spans / picture_recovery / table_reocr re-open it by path
+    mid-pipeline, so it cannot be cleaned up eagerly — the CALLER owns
+    `temp_dir` and is responsible for removing it when the document is done.
     """
     out_dir = tempfile.mkdtemp(prefix="ocr_docx_pdf_")
     cmd = [
@@ -70,7 +95,18 @@ def load_pages_from_docx(docx_path: str) -> List[Dict]:
     if not pdf_files:
         raise Exception("LibreOffice produced no PDF output")
 
-    return load_pages_from_pdf(os.path.join(out_dir, pdf_files[0]))
+    return os.path.join(out_dir, pdf_files[0]), out_dir
+
+
+def load_pages_from_docx(docx_path: str) -> List[Dict]:
+    """Convert DOCX → PDF via LibreOffice, then load pages with geometry.
+
+    Leaks the intermediate PDF's temp dir by design — see `docx_to_pdf` for the
+    lifetime constraint. Callers that care should use `docx_to_pdf` directly and
+    clean up themselves.
+    """
+    pdf_path, _out_dir = docx_to_pdf(docx_path)
+    return load_pages_from_pdf(pdf_path)
 
 
 def load_pages_from_image(image_path: str) -> List[Dict]:
@@ -174,12 +210,17 @@ def _entries_from_page(page_or_entries) -> List[Dict]:
     return []
 
 
-def layoutjson2md(image: Image.Image, layout_data, text_key: str = "text") -> str:
+def layoutjson2md(layout_data, text_key: str = "text",
+                  image: Optional[Image.Image] = None) -> str:
     """Convert layout entries (sorted by reading order) into Markdown.
 
     Accepts either:
       - legacy: List[Dict] of layout entries
       - new:    Dict with "entries" key (per-page envelope)
+
+    `image` is accepted for backwards compatibility and ignored — the page
+    raster is not needed to serialize markdown. Keeping it out of the call path
+    lets the pipeline free each page's raster as soon as its crops are taken.
     """
     entries = _entries_from_page(layout_data)
     markdown_lines: List[str] = []

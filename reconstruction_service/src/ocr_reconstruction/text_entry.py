@@ -8,7 +8,9 @@ from typing import Dict, Optional
 
 
 def render_text_entry(ctx, entry: Dict) -> None:
-    from .geometry import bbox_px_to_emu, EMU_PER_PT
+    from .geometry import (
+        bbox_px_to_emu, EMU_PER_PT, is_quarter_turn, normalize_rotation,
+    )
     from .ooxml import (
         build_anchored_textbox_xml, build_paragraph_xml, build_run_xml,
     )
@@ -46,6 +48,15 @@ def render_text_entry(ctx, entry: Dict) -> None:
     x1, y1, x2, y2 = bbox
     box_w_pt = max(1.0, (x2 - x1) / ctx.zoom)
     box_h_pt = max(1.0, (y2 - y1) / ctx.zoom)
+    # A quarter-turned entry reads along the box's OTHER axis, so the fitter
+    # must measure against the swapped pair — the shape itself is unrotated
+    # (`bodyPr vert=` spins only the text), so its geometry stays as computed.
+    # Without this the fitter tries to wrap the text across the narrow side and
+    # shrinks it to the readable floor: the 21pt-wide side-labels rendered at
+    # 5.5pt with words broken mid-token.
+    rotation = normalize_rotation(entry.get("rotation"))
+    if is_quarter_turn(rotation):
+        box_w_pt, box_h_pt = box_h_pt, box_w_pt
     base_size_pt = float(style.get("size") or 11.0)
     fitted, lines = fit_multiline(text, box_w_pt, box_h_pt, max_size_pt=base_size_pt)
 
@@ -56,7 +67,11 @@ def render_text_entry(ctx, entry: Dict) -> None:
     # content — e.g. long footers/titles the OCR gave a too-short bbox), keep
     # the readable floor size, wrap the FULL text, and GROW the box downward to
     # hold every line (spAutoFit). Readable-and-taller beats a lost line.
-    body_auto_fit = lines is None
+    # Growth is DOWNWARD-only, which is meaningless once the text is turned:
+    # a rotated box would have to grow sideways, straight into whatever sits
+    # beside it (on these pages, the diagram itself). Deliberate limitation —
+    # rotated text that overruns shrinks to the readable floor instead.
+    body_auto_fit = lines is None and not is_quarter_turn(rotation)
     if lines is None:
         floor_pt = 6.0
         style["size"] = min(base_size_pt, floor_pt)
@@ -70,8 +85,12 @@ def render_text_entry(ctx, entry: Dict) -> None:
                 natural_h = max(natural_h, floor_pt * 1.2)
             line_h_pt = natural_h * 1.10
             needed_h_pt = max(box_h_pt, line_h_pt * len(wrapped))
-            # Grow the emitted box height to hold all lines.
-            h = max(h, int(round(needed_h_pt * EMU_PER_PT)))
+            # Grow the emitted box height to hold all lines. Skipped when the
+            # text is turned: `h` is then the box's SHORT side, and stretching
+            # it would fatten the label across the drawing instead of
+            # lengthening it along its reading direction.
+            if not is_quarter_turn(rotation):
+                h = max(h, int(round(needed_h_pt * EMU_PER_PT)))
     else:
         if fitted < base_size_pt:
             style["size"] = fitted
@@ -102,5 +121,6 @@ def render_text_entry(ctx, entry: Dict) -> None:
         build_anchored_textbox_xml(
             x, y, w, h, para_xml, ctx._next_id(),
             body_auto_fit=body_auto_fit,
+            rotation=rotation,
         )
     )

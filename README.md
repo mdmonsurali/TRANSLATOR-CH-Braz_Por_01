@@ -1,4 +1,4 @@
-# TRANSLATOR-CH-Braz_Por
+# TRANSLATOR-CH-Braz_Por_01
 
 A microservice pipeline that turns scanned/native PDFs and DOCX files into
 structured, layout-preserving output: OCR → layout JSON → reconstructed DOCX,

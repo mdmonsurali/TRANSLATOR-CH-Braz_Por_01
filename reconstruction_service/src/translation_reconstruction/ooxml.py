@@ -289,6 +289,26 @@ def build_paragraph_xml(
     return f"<w:p><w:pPr>{spacing}{jc}</w:pPr>{runs_xml}</w:p>"
 
 
+def _normalize_rotation(value) -> float:
+    """Local mirror of geometry.normalize_rotation.
+
+    Duplicated deliberately: ooxml.py has no other dependency on geometry.py and
+    this keeps the XML builders importable on their own (both reconstruction
+    copies rely on that). Keep the snap tolerance in step with geometry.py.
+    """
+    try:
+        deg = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    if deg != deg or deg in (float("inf"), float("-inf")):
+        return 0.0
+    deg %= 360.0
+    for quarter in (0.0, 90.0, 180.0, 270.0, 360.0):
+        if abs(deg - quarter) <= 5.0:
+            return quarter % 360.0
+    return deg
+
+
 def build_anchored_textbox_xml(
     x_emu: int,
     y_emu: int,
@@ -298,6 +318,8 @@ def build_anchored_textbox_xml(
     docpr_id: int,
     body_auto_fit: bool = False,
     fill_rgb: str | None = None,
+    rotation: float = 0.0,
+    rotate_shape: bool = False,
 ) -> str:
     """Floating text box anchored at (x,y) on the page, holding arbitrary
     `<w:p>...` content. Returns an `<mc:AlternateContent>` block to drop
@@ -313,6 +335,11 @@ def build_anchored_textbox_xml(
     overlay translated labels ON TOP of a diagram raster — the fill hides the
     original-language text underneath while the run carries the translation.
 
+    `rotate_shape` picks which rotation mechanism a quarter turn uses (see the
+    comment below). Callers that hold TEXT must leave it False; callers that
+    hold a `<w:tbl>` (or anything else that must physically turn) must pass
+    True together with a transposed extent from `geometry.rotated_shape_geometry`.
+
     CRITICAL FIX: Forces allowOverlap="0" to stop boundary collision overlaps.
     """
     name = f"TxtBox{docpr_id}"
@@ -321,6 +348,33 @@ def build_anchored_textbox_xml(
         f'<a:solidFill><a:srgbClr val="{fill_rgb}"/></a:solidFill>'
         if fill_rgb else "<a:noFill/>"
     )
+    # Rotation. Two OOXML mechanisms, and they are MUTUALLY EXCLUSIVE — a shape
+    # gets `vert=` or `rot=`, never both:
+    #   * `bodyPr vert=` spins the TEXT inside an unrotated box. The shape
+    #     geometry (and therefore the page clamp and the frozen-wrap fit) stays
+    #     exactly as computed. Verified in Word and LibreOffice. This is the
+    #     right renderer for a plain rotated label.
+    #   * `a:xfrm rot=` spins the whole SHAPE about its centre. Callers must hand
+    #     us the transposed extent from geometry.rotated_shape_geometry, or the
+    #     box lands offset. This is the ONLY mechanism that can turn a
+    #     `<w:tbl>`: `vert=` reflows text inside cells and leaves the grid
+    #     upright, so a rotated table must take this path.
+    # `rotate_shape` is what lets the caller choose, because the angle alone
+    # can't express the difference: a 90° label and a 90° table need different
+    # mechanisms. Non-quarter angles have only one option (`rot=`) either way.
+    # `rotation == 0` must emit byte-identical XML to the pre-rotation code.
+    rot = _normalize_rotation(rotation)
+    vert_attr = ""
+    xfrm_rot_attr = ""
+    if rot and (rotate_shape or rot not in (90.0, 270.0)):
+        # OOXML `rot` is CLOCKWISE-positive in 60000ths of a degree; our schema
+        # is counter-clockwise-positive, hence the negation.
+        xfrm_rot_attr = f' rot="{int(round((-rot % 360.0) * 60000))}"'
+    elif rot == 90.0:
+        vert_attr = ' vert="vert270"'      # glyphs turned CW, reads bottom-to-top
+    elif rot == 270.0:
+        vert_attr = ' vert="vert"'         # glyphs turned CCW, reads top-to-bottom
+
     return (
         f'<mc:AlternateContent{attrs_for_anchor()}>'
         f'<mc:Choice Requires="wps">'
@@ -340,7 +394,7 @@ def build_anchored_textbox_xml(
         f'<a:graphicData uri="{NS_WPS}">'
         f'<wps:wsp>'
         f'<wps:cNvSpPr txBox="1"/>'
-        f'<wps:spPr><a:xfrm>'
+        f'<wps:spPr><a:xfrm{xfrm_rot_attr}>'
         f'<a:off x="0" y="0"/><a:ext cx="{w_emu}" cy="{h_emu}"/>'
         f'</a:xfrm>'
         f'<a:prstGeom prst="rect"><a:avLst/></a:prstGeom>'
@@ -349,7 +403,7 @@ def build_anchored_textbox_xml(
         f'</wps:spPr>'
         f'<wps:txbx><w:txbxContent>{inner_body_xml}</w:txbxContent></wps:txbx>'
         f'<wps:bodyPr wrap="square" lIns="0" tIns="0" rIns="0" bIns="0"'
-        f' anchor="t" anchorCtr="0">{autofit_xml}</wps:bodyPr>'
+        f' anchor="t" anchorCtr="0"{vert_attr}>{autofit_xml}</wps:bodyPr>'
         f'</wps:wsp>'
         f'</a:graphicData></a:graphic>'
         f'</wp:anchor>'

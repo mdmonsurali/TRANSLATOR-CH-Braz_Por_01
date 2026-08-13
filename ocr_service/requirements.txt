@@ -10,6 +10,10 @@ python-multipart==0.0.20
 # vLLM client
 openai==2.1.0
 
+# PaddleOCR detection service client (diagram_text_recovery). Already present
+# transitively via `openai`; pinned explicitly because we now import it directly.
+httpx==0.28.1
+
 # Document & image processing
 pillow==11.3.0
 PyMuPDF==1.27.2.3

@@ -11,9 +11,11 @@ the raster untouched.
 Detection uses **PaddleOCR**, NOT Chandra: re-OCRing a diagram crop with Chandra
 just collapses the connected flowchart back into one mermaid block with no
 coordinates. PaddleOCR returns tight per-line boxes + text (incl. edge labels).
-Because PaddleOCR's deps (``numpy<2.6``/``opencv<4.13``) conflict with vLLM's, it
-runs in an ISOLATED venv (``/opt/paddle-venv``) invoked as a subprocess — see
-``paddle_ocr_worker.py``.
+Because PaddleOCR brings its own paddlepaddle/paddlex stack (which floats
+numpy/opencv against vLLM's pins), it runs as its OWN COMPOSE SERVICE —
+``paddle_service`` on port 8005 — which holds the model resident across
+diagrams. Crops are posted as raw PNG bytes, so no temp file or path is shared
+between processes.
 
 Each detected line becomes a ``{bbox (page px), text, style}`` dict; the regions
 are attached as ``entry["diagram_regions"]``. The translator then translates each
@@ -24,18 +26,17 @@ Public surface
 --------------
 recover_diagram_text(pages) — async; for every ``diagram-recovered`` Image entry,
 attach ``diagram_regions``. Mutates ``pages`` in place and returns it. A no-op for
-pages with no such entry (and no PaddleOCR subprocess is spawned).
+pages with no such entry (and no request to the PaddleOCR service is made).
 """
 
 from __future__ import annotations
 
-import asyncio
-import json
+import io
 import logging
 import os
-import tempfile
 from typing import List, Optional
 
+import httpx
 from PIL import Image
 
 log = logging.getLogger("ocr_service")
@@ -66,13 +67,14 @@ _CLUSTER_X_OVERLAP_FRAC = 0.30
 _CLUSTER_Y_GAP_FACTOR = 0.8
 _CLUSTER_Y_GAP_CAP_FACTOR = 1.2   # × median line height (absolute-ish ceiling)
 
-# Isolated PaddleOCR venv + worker (baked into the image; see ocr_service
-# Dockerfile). Overridable for local dev / tests.
-PADDLE_PYTHON = os.getenv("PADDLE_VENV_PYTHON", "/opt/paddle-venv/bin/python")
-PADDLE_WORKER = os.getenv(
-    "PADDLE_WORKER",
-    os.path.join(os.path.dirname(__file__), "paddle_ocr_worker.py"),
-)
+# PaddleOCR runs as its own compose service (`paddle_service`), not as an
+# in-image venv subprocess: its paddlepaddle/paddlex stack floats numpy/opencv
+# against vLLM's pins, and a separate image makes a collision impossible. The
+# crop travels as raw bytes in the request body, so there is no temp file and no
+# path handed between processes.
+PADDLE_SERVICE_URL = os.getenv(
+    "PADDLE_SERVICE_URL", "http://paddle_service:8005",
+).rstrip("/")
 PADDLE_LANG = os.getenv("DIAGRAM_OCR_LANG", "ch")
 PADDLE_TIMEOUT_SEC = float(os.getenv("DIAGRAM_OCR_TIMEOUT_SEC", "300"))
 # Drop low-confidence detections (PaddleOCR emits stray marks like "+"/"一" on
@@ -81,48 +83,80 @@ PADDLE_TIMEOUT_SEC = float(os.getenv("DIAGRAM_OCR_TIMEOUT_SEC", "300"))
 # alpha-only filter below removes the punctuation noise the low floor lets in.
 MIN_CONF = float(os.getenv("DIAGRAM_OCR_MIN_CONF", "0.45"))
 
+# Rotation detection lives in `rotation_measure` so this module and
+# `rotation_detect` share ONE implementation of "is this line rotated". The
+# kill switch and thresholds (and their env vars) are documented there.
+from rotation_measure import (  # noqa: E402 — grouped with the other tunables
+    ROT_ASPECT_MIN, ROT_ENABLE, ROT_SKEW_MIN_DEG,
+    line_rotation, modal_rotation, poly_skew_deg,
+)
+
 # Margin (px) around the diagram bbox when cropping — a little air helps detect
 # labels that sit flush against a box ruling.
 _CROP_MARGIN_PX = 8
 
 
-async def _paddle_detect(crop: Image.Image) -> Optional[List[dict]]:
-    """Run the isolated PaddleOCR worker on `crop`. Returns a list of
-    ``{bbox (crop-local px), text, conf}`` or None on failure."""
-    tmp_path = None
-    try:
-        with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as f:
-            tmp_path = f.name
-            crop.save(f, format="PNG")
+# One shared client for the whole run: connection reuse matters because a
+# document can issue hundreds of diagram crops. The service holds the model
+# resident and serialises predicts on its own side, so this side needs no lock.
+_client: Optional["httpx.AsyncClient"] = None
 
-        proc = await asyncio.create_subprocess_exec(
-            PADDLE_PYTHON, PADDLE_WORKER, tmp_path, PADDLE_LANG,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
+
+def _paddle_client() -> "httpx.AsyncClient":
+    """Return the shared HTTP client, creating it on first use."""
+    global _client
+    if _client is None or _client.is_closed:
+        _client = httpx.AsyncClient(
+            base_url=PADDLE_SERVICE_URL,
+            timeout=httpx.Timeout(PADDLE_TIMEOUT_SEC, connect=10.0),
         )
-        try:
-            out, err = await asyncio.wait_for(
-                proc.communicate(), timeout=PADDLE_TIMEOUT_SEC
-            )
-        except asyncio.TimeoutError:
-            proc.kill()
-            log.warning("[diagram-text] PaddleOCR worker timed out")
-            return None
+    return _client
 
-        if proc.returncode != 0:
-            log.warning("[diagram-text] PaddleOCR worker failed (rc=%s): %s",
-                        proc.returncode, (err or b"").decode("utf-8", "replace")[-500:])
+
+async def shutdown_paddle_worker() -> None:
+    """Close the shared client (idempotent).
+
+    Kept under the original name so `main`'s shutdown hook is unchanged; there
+    is no longer a subprocess to reap, only a connection pool to release.
+    """
+    global _client
+    client = _client
+    _client = None
+    if client is not None and not client.is_closed:
+        try:
+            await client.aclose()
+        except Exception:  # noqa: BLE001 — best-effort teardown
+            pass
+
+
+async def _paddle_detect(crop: Image.Image) -> Optional[List[dict]]:
+    """Detect text lines in `crop` via the PaddleOCR service. Returns a list of
+    ``{bbox (crop-local px), poly, text, conf}`` or None on failure.
+
+    The PNG is posted as the request body. Nothing is written to disk, which is
+    what retired the old ``FileNotFoundError``/desync failures: there is no path
+    whose lifetime has to outlive a subprocess's read-ahead buffer.
+    """
+    try:
+        buf = io.BytesIO()
+        crop.save(buf, format="PNG")
+        resp = await _paddle_client().post(
+            "/detect",
+            content=buf.getvalue(),
+            params={"lang": PADDLE_LANG},
+            headers={"Content-Type": "application/octet-stream"},
+        )
+        resp.raise_for_status()
+        payload = resp.json()
+        if not payload.get("ok"):
+            log.warning("[diagram-text] PaddleOCR service error: %s",
+                        payload.get("error"))
             return None
-        return json.loads((out or b"").decode("utf-8") or "[]")
+        return payload.get("lines") or []
     except Exception as exc:  # noqa: BLE001 — one bad diagram must not fail OCR
-        log.warning("[diagram-text] PaddleOCR invocation error: %s", exc)
+        log.warning("[diagram-text] PaddleOCR request failed: %s: %s",
+                    type(exc).__name__, exc)
         return None
-    finally:
-        if tmp_path:
-            try:
-                os.unlink(tmp_path)
-            except OSError:
-                pass
 
 
 def _x_overlap_frac(a: List[float], b: List[float]) -> float:
@@ -132,17 +166,56 @@ def _x_overlap_frac(a: List[float], b: List[float]) -> float:
     return inter / narrow
 
 
+def _y_overlap_frac(a: List[float], b: List[float]) -> float:
+    """Fraction of the SHORTER y-span [y0,y1] that overlaps the other's.
+
+    The transpose of `_x_overlap_frac`, used to cluster quarter-turned lines
+    (which sit side by side rather than stacked).
+    """
+    inter = max(0.0, min(a[3], b[3]) - max(a[1], b[1]))
+    short = max(1.0, min(a[3] - a[1], b[3] - b[1]))
+    return inter / short
+
+
 def _cluster_lines(lines: List[dict]) -> List[List[dict]]:
     """Group PaddleOCR line boxes into per-node clusters using geometry only.
 
-    Two lines join the same node when they overlap horizontally and are
-    vertically adjacent (gap ≤ _CLUSTER_Y_GAP_FACTOR × the local line height).
-    Union-find over those pairwise links yields the clusters, so a 3-line node
-    chains together transitively. Fully document-independent — every threshold is
-    relative to the lines' own measured heights.
+    Lines are PARTITIONED BY ROTATION first and clustered within each partition,
+    so an upright node and a rotated side-label sitting next to it can never
+    merge into one entry. Upright lines take the original code path unchanged.
+
+    Within a partition, two lines join the same node when they overlap along the
+    text's cross-axis and are adjacent along its stacking axis (gap ≤
+    _CLUSTER_Y_GAP_FACTOR × the local line thickness). For upright text that is
+    "overlap in x, adjacent in y"; for quarter-turned text the axes swap, which
+    is why a rotated multi-line label never merged before. Union-find over those
+    pairwise links yields the clusters, so a 3-line node chains transitively.
+    Fully document-independent — every threshold is relative to the lines' own
+    measured thickness.
 
     `lines` are dicts with a crop-local ``bbox`` [x0,y0,x1,y1]. Returns a list of
     clusters, each a list of the member line dicts.
+    """
+    partitions: dict = {}
+    for ln in lines:
+        # 90 and 270 stack along the same axis; group them together and let the
+        # transposed predicates handle both.
+        rot = float(ln.get("rotation") or 0.0)
+        partitions.setdefault(1 if rot in (90.0, 270.0) else 0, []).append(ln)
+
+    out: List[List[dict]] = []
+    for sideways, group in partitions.items():
+        out.extend(_cluster_one_orientation(group, bool(sideways)))
+    return out
+
+
+def _cluster_one_orientation(lines: List[dict],
+                             sideways: bool) -> List[List[dict]]:
+    """Union-find clustering for one rotation partition.
+
+    `sideways=False` reproduces the original upright behaviour exactly.
+    `sideways=True` transposes both predicates: overlap is measured in y and
+    adjacency in x, because quarter-turned lines stack horizontally.
     """
     n = len(lines)
     parent = list(range(n))
@@ -156,22 +229,32 @@ def _cluster_lines(lines: List[dict]) -> List[List[dict]]:
     def union(i: int, j: int) -> None:
         parent[find(i)] = find(j)
 
-    # Diagram's typical line height → an absolute ceiling on the mergeable gap,
-    # so a single very tall box can't bridge the whitespace between two nodes.
-    heights = sorted(max(1.0, ln["bbox"][3] - ln["bbox"][1]) for ln in lines)
-    median_h = heights[len(heights) // 2] if heights else 1.0
+    def thickness(b) -> float:
+        # Cross-axis extent = the line's height for upright text, its width
+        # once turned. This is what the gap thresholds are relative to.
+        return max(1.0, (b[2] - b[0]) if sideways else (b[3] - b[1]))
+
+    # Diagram's typical line thickness → an absolute ceiling on the mergeable
+    # gap, so a single very long box can't bridge the whitespace between nodes.
+    thicknesses = sorted(thickness(ln["bbox"]) for ln in lines)
+    median_h = thicknesses[len(thicknesses) // 2] if thicknesses else 1.0
     gap_cap = _CLUSTER_Y_GAP_CAP_FACTOR * median_h
 
     for i in range(n):
         bi = lines[i]["bbox"]
-        hi = max(1.0, bi[3] - bi[1])
+        hi = thickness(bi)
         for j in range(i + 1, n):
             bj = lines[j]["bbox"]
-            hj = max(1.0, bj[3] - bj[1])
-            if _x_overlap_frac(bi, bj) < _CLUSTER_X_OVERLAP_FRAC:
+            hj = thickness(bj)
+            overlap = (_y_overlap_frac(bi, bj) if sideways
+                       else _x_overlap_frac(bi, bj))
+            if overlap < _CLUSTER_X_OVERLAP_FRAC:
                 continue
-            # Vertical gap between the two boxes (0 if they touch/overlap in y).
-            gap = max(bi[1], bj[1]) - min(bi[3], bj[3])
+            # Gap between the two boxes along the stacking axis (0 if touching).
+            if sideways:
+                gap = max(bi[0], bj[0]) - min(bi[2], bj[2])
+            else:
+                gap = max(bi[1], bj[1]) - min(bi[3], bj[3])
             gap_allowed = min(_CLUSTER_Y_GAP_FACTOR * min(hi, hj), gap_cap)
             if gap <= gap_allowed:
                 union(i, j)
@@ -180,6 +263,24 @@ def _cluster_lines(lines: List[dict]) -> List[List[dict]]:
     for i in range(n):
         groups.setdefault(find(i), []).append(lines[i])
     return list(groups.values())
+
+
+def _assign_line_rotations(lines: List[dict]) -> None:
+    """Stamp `rotation` (degrees, CCW-positive) on each detected line in place.
+
+    The measurement itself lives in `rotation_measure.line_rotation` — see that
+    module for how rotation is detected and why. Kept as a thin wrapper because
+    the clustering code below reads `ln["rotation"]` directly.
+
+    A rotated CJK label reads bottom-to-top (glyphs turned 90° clockwise), which
+    is `rotation = 90` in our CCW-positive schema.
+    """
+    if not ROT_ENABLE:
+        return
+    for ln in lines:
+        ln["rotation"] = line_rotation(
+            ln["bbox"], ln.get("text") or "", ln.get("poly"),
+        )
 
 
 async def _recover_one_diagram(entry: dict, page_img: Image.Image,
@@ -224,20 +325,42 @@ async def _recover_one_diagram(entry: dict, page_img: Image.Image,
         db = det.get("bbox")
         if not db or len(db) != 4:
             continue
-        lines.append({"bbox": [float(v) for v in db], "text": text})
+        lines.append({
+            "bbox": [float(v) for v in db],
+            "text": text,
+            "conf": float(det.get("conf") or 0.0),
+            "poly": det.get("poly"),
+        })
 
     if not lines:
         log.info("[diagram-text] all detections below conf floor for diagram at %s",
                  bbox)
         return []
 
+    # 1b) Stamp each line's rotation (0 unless it reads as a rotated label).
+    _assign_line_rotations(lines)
+
     # 2) Cluster lines into per-node labels (a flowchart node's multi-line text
     #    arrives as several line boxes; merge them into ONE label so it reads and
     #    translates as a unit and overlays as one box).
     labels: List[dict] = []
     for cluster in _cluster_lines(lines):
-        # Reading order: top-to-bottom, then left-to-right.
-        cluster.sort(key=lambda ln: (ln["bbox"][1], ln["bbox"][0]))
+        # The cluster's rotation is the modal rotation of its members. They
+        # should agree — _cluster_lines never merges across orientations — so
+        # this is really just "pick the one value present".
+        cluster_rot = modal_rotation(
+            [float(ln.get("rotation") or 0.0) for ln in cluster]
+        )
+
+        # Reading order follows the text direction: top-to-bottom then
+        # left-to-right when upright, but bottom-to-top for a 90° label (which
+        # reads upward) and top-to-bottom with columns right-to-left at 270°.
+        if cluster_rot == 90.0:
+            cluster.sort(key=lambda ln: (-ln["bbox"][3], ln["bbox"][0]))
+        elif cluster_rot == 270.0:
+            cluster.sort(key=lambda ln: (ln["bbox"][1], -ln["bbox"][0]))
+        else:
+            cluster.sort(key=lambda ln: (ln["bbox"][1], ln["bbox"][0]))
         text = " ".join(ln["text"] for ln in cluster).strip()
         if not text:
             continue
@@ -250,14 +373,24 @@ async def _recover_one_diagram(entry: dict, page_img: Image.Image,
             int(round(cx0 + ux0)), int(round(cy0 + uy0)),
             int(round(cx0 + ux1)), int(round(cy0 + uy1)),
         ]
-        # Font size from the PER-LINE height (median across the node's lines), NOT
-        # the merged multi-line height — otherwise a 2/3-line node would get a
-        # 2–3× font. Same box-height heuristic chandra_style uses for scanned text.
-        line_heights = sorted(max(1.0, ln["bbox"][3] - ln["bbox"][1]) for ln in cluster)
-        median_h = line_heights[len(line_heights) // 2]
+        # Font size from the PER-LINE CROSS-AXIS extent (median across the node's
+        # lines), NOT the merged multi-line extent — otherwise a 2/3-line node
+        # would get a 2–3× font. Same box-height heuristic chandra_style uses for
+        # scanned text.
+        #
+        # For a quarter-turned line the glyph height is the box WIDTH: its height
+        # is the text's LENGTH. Measuring height there gave 58pt and 103pt on the
+        # real labels, both silently swallowed by the _MAX_SIZE_PT clamp.
+        sideways = cluster_rot in (90.0, 270.0)
+        extents = sorted(
+            max(1.0, (ln["bbox"][2] - ln["bbox"][0]) if sideways
+                else (ln["bbox"][3] - ln["bbox"][1]))
+            for ln in cluster
+        )
+        median_h = extents[len(extents) // 2]
         size_pt = round((median_h / max(zoom, 1e-6)) * _SIZE_HEIGHT_FACTOR, 1)
         size_pt = max(_MIN_SIZE_PT, min(size_pt, _MAX_SIZE_PT))
-        labels.append({
+        label = {
             # A normal Text layout entry: surfaces in the OCR JSON + markdown and
             # is translated like any other prose. `source="diagram-label"` marks
             # it so reflow pins it to its parent diagram and reconstruction renders
@@ -268,7 +401,12 @@ async def _recover_one_diagram(entry: dict, page_img: Image.Image,
             "style": {"font": "Calibri", "size": size_pt, "bold": False,
                       "color": [0, 0, 0], "source": "diagram-heuristic"},
             "source": "diagram-label",
-        })
+        }
+        # Only stamp `rotation` when there is one, so upright labels serialize
+        # byte-identically to before this feature existed.
+        if cluster_rot:
+            label["rotation"] = cluster_rot
+        labels.append(label)
 
     if not labels:
         return []

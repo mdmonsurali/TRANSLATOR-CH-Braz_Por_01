@@ -228,6 +228,10 @@ async def insert_document(original_name: str, ext: str, source_bytes: bytes,
     return doc_id
 
 
+# `layout` (JSONB) is still writable but the OCR pipeline no longer populates
+# it: it duplicated documents/{uuid}/layout.json in MinIO, cost a full extra
+# serialization of the document at peak memory, and had no reader — the
+# list/detail routes pop the column straight back off.
 _ALLOWED_UPDATE_COLS = {
     "status", "scan_type", "page_count", "markdown_key", "json_key",
     "docx_key", "layout", "elapsed_sec", "error",

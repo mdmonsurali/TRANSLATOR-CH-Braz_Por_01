@@ -15,7 +15,16 @@ LLAMA_PORT = os.getenv("LLAMA_PORT", "8090")
 LLAMA_BASE_URL = f"http://{LLAMA_HOST}:{LLAMA_PORT}"
 
 TRANSLATE_MAX_TOKENS = int(os.getenv("TRANSLATE_MAX_TOKENS", "4096"))
-TRANSLATE_TIMEOUT_SEC = float(os.getenv("TRANSLATE_TIMEOUT_SEC", "600"))
+# PER-REQUEST ceiling on one llama.cpp call (a chunk of ~20 strings) — the
+# translator's equivalent of OCR_REQUEST_TIMEOUT_SEC, and the timeout that
+# actually protects the pipeline. On timeout the chunk keeps its source text and
+# is counted as `failed`; the rest of the document still translates.
+#
+# Deliberately NOT named TRANSLATE_TIMEOUT_SEC: that name is already the
+# orchestrator's whole-document safety net (24h). Sharing it would silently
+# stretch this per-chunk bound to 24h and re-introduce the hang it prevents.
+TRANSLATE_REQUEST_TIMEOUT_SEC = float(
+    os.getenv("TRANSLATE_REQUEST_TIMEOUT_SEC", "600"))
 
 
 async def chat_completion(
@@ -44,7 +53,7 @@ async def chat_completion(
 
     owns_client = client is None
     if owns_client:
-        client = httpx.AsyncClient(timeout=TRANSLATE_TIMEOUT_SEC)
+        client = httpx.AsyncClient(timeout=TRANSLATE_REQUEST_TIMEOUT_SEC)
     try:
         resp = await client.post(f"{LLAMA_BASE_URL}/v1/chat/completions", json=payload)
         resp.raise_for_status()

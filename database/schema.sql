@@ -89,3 +89,14 @@ CREATE INDEX IF NOT EXISTS translations_owner_idx
     ON translations (owner_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS translations_source_idx
     ON translations (source_document_id);
+
+-- Checkpointing for long translations. A 1000-page document takes hours, so
+-- the work is persisted every TRANSLATE_PAGE_WINDOW pages: `pages_done` is how
+-- many leading pages are fully translated, `checkpoint_key` is the MinIO object
+-- holding the partially-translated layout JSON. A job that dies (timeout, GPU
+-- swap, container restart) resumes from `pages_done` instead of restarting.
+-- Both NULL/0 means "no checkpoint" — the normal state for short documents.
+ALTER TABLE translations
+    ADD COLUMN IF NOT EXISTS pages_done      INT,
+    ADD COLUMN IF NOT EXISTS page_count      INT,
+    ADD COLUMN IF NOT EXISTS checkpoint_key  TEXT;

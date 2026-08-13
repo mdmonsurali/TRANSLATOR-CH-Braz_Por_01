@@ -1,0 +1,12 @@
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+python-multipart==0.0.20
+# PaddleOCR's own stack. Pinned to the versions the ocr_service venv used, so
+# behaviour (PP-OCRv6 models, conf scores) is identical to the in-image worker
+# this service replaces. numpy/opencv/pillow float freely here — that is the
+# whole point of the separate image: they can never collide with vLLM's.
+setuptools
+paddlepaddle==3.3.1
+paddleocr==3.7.0
+pillow
+numpy

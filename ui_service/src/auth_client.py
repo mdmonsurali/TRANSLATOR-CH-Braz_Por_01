@@ -13,7 +13,7 @@ import httpx
 log = logging.getLogger("ui_service.auth_client")
 
 AUTH_SERVICE_URL = os.environ.get("AUTH_SERVICE_URL", "http://auth_service:8002")
-SESSION_COOKIE_NAME = "translator_ch_braz_por_session"
+SESSION_COOKIE_NAME = "translator_ch_braz_por_01_session"
 _VALIDATE_CACHE_TTL = 30.0  # seconds
 
 
