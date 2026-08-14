@@ -310,6 +310,24 @@ def _identity_headers(user: auth_client.CurrentUser) -> dict:
     return {"X-User-Id": user.id, "X-User-Role": user.role}
 
 
+def _forward_disposition(resp: httpx.Response) -> dict:
+    """Copy an upstream Content-Disposition, dropping it if it cannot be sent.
+
+    Header values must be latin-1 encodable; a service that has not picked up
+    the RFC 6266 encoding yet could hand us a raw CJK filename, which would
+    make Starlette raise while building OUR response. Losing the filename hint
+    beats 500-ing the download.
+    """
+    disposition = resp.headers.get("content-disposition")
+    if not disposition:
+        return {}
+    try:
+        disposition.encode("latin-1")
+    except UnicodeEncodeError:
+        return {}
+    return {"Content-Disposition": disposition}
+
+
 def _safe_next(raw: Optional[str]) -> str:
     if not raw:
         return "/"
@@ -555,14 +573,10 @@ async def document_artifact(request: Request, doc_id: str, kind: str):
         raise HTTPException(status_code=resp.status_code, detail=resp.text)
 
     content_type = resp.headers.get("content-type", "application/octet-stream")
-    disposition  = resp.headers.get("content-disposition")
-    headers = {}
-    if disposition:
-        headers["Content-Disposition"] = disposition
     return StreamingResponse(
         iter([resp.content]),
         media_type=content_type,
-        headers=headers,
+        headers=_forward_disposition(resp),
     )
 
 
@@ -1104,14 +1118,10 @@ async def get_translation_artifact(request: Request, trans_id: str, kind: str):
     if resp.status_code != 200:
         raise HTTPException(status_code=resp.status_code, detail=resp.text)
     content_type = resp.headers.get("content-type", "application/octet-stream")
-    disposition = resp.headers.get("content-disposition")
-    headers = {}
-    if disposition:
-        headers["Content-Disposition"] = disposition
     return StreamingResponse(
         iter([resp.content]),
         media_type=content_type,
-        headers=headers,
+        headers=_forward_disposition(resp),
     )
 
 

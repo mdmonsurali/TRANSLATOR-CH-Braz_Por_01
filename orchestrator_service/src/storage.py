@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import re
 import uuid as _uuid
 from typing import Optional
 
@@ -171,7 +172,9 @@ async def get_artifact_bytes(row: dict, kind: str) -> tuple[str, str, bytes]:
     # strip ext on the stem so we don't end up with foo.pdf.docx
     if "." in stem:
         stem = stem.rsplit(".", 1)[0]
-    lang = row.get("target_lang") or "translated"
+    # target_lang arrives from a user-supplied form field and lands in a
+    # Content-Disposition header, so keep it to plain tag characters.
+    lang = re.sub(r"[^A-Za-z0-9_-]", "", row.get("target_lang") or "") or "translated"
     filename = f"{stem}_{lang}{_ARTIFACT_SUFFIX[kind]}"
     return filename, _ARTIFACT_CONTENT_TYPE[kind], body
 

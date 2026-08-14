@@ -34,6 +34,7 @@ from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 import storage
 import llama_client
+from content_disposition import content_disposition, safe_zip_name
 from identity import Identity, require_user
 from pipeline import (
     SUPPORTED_EXTS,
@@ -324,7 +325,7 @@ async def translate_batch_zip(payload: dict = Body(...),
                 continue
             if row.get("owner_id") != identity.id:
                 continue
-            stem = Path(row["original_name"]).stem or str(trans_id)
+            stem = safe_zip_name(Path(row["original_name"]).stem, str(trans_id))
             for kind in ("translated_json", "translated_docx"):
                 try:
                     fname, _ctype, body = await storage.get_artifact_bytes(
@@ -403,8 +404,9 @@ async def get_translation_artifact(trans_id: str, kind: str,
         iter([body]),
         media_type=content_type,
         headers={
-            "Content-Disposition":
-                f'{disposition}; filename="{filename}"',
+            "Content-Disposition": content_disposition(
+                disposition, filename, str(tid),
+            ),
         },
     )
 

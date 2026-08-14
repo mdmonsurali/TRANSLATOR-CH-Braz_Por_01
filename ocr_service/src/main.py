@@ -59,6 +59,7 @@ from rotation_detect import detect_rotation
 from table_validate import validate_tables
 
 import storage
+from content_disposition import content_disposition, safe_zip_name
 
 log = logging.getLogger("ocr_service")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -789,7 +790,7 @@ async def ocr_batch_zip(payload: dict = Body(...),
                 continue
             if doc.get("owner_id") != identity.id:
                 continue
-            stem = Path(doc["original_name"]).stem or str(doc_id)
+            stem = safe_zip_name(Path(doc["original_name"]).stem, str(doc_id))
             for kind in ("md", "json", "docx"):
                 try:
                     filename, _ctype, body = await storage.get_artifact_bytes(doc_id, kind)
@@ -885,7 +886,11 @@ async def get_document_image(doc_id: str, filename: str,
     return Response(
         content=body,
         media_type=content_type,
-        headers={"Content-Disposition": f'inline; filename="{fname}"'},
+        headers={
+            "Content-Disposition": content_disposition(
+                "inline", fname, str(uid),
+            ),
+        },
     )
 
 
@@ -907,11 +912,15 @@ async def get_document_artifact(doc_id: str, kind: str,
         raise HTTPException(404, str(e))
 
     # JSON/MD viewed inline so the UI can pretty-print without download dance.
-    disposition = "inline" if kind in {"md", "json"} else f'attachment; filename="ocr_{filename}"'
+    disposition = "inline" if kind in {"md", "json"} else "attachment"
     return Response(
         content=body,
         media_type=content_type,
-        headers={"Content-Disposition": disposition},
+        headers={
+            "Content-Disposition": content_disposition(
+                disposition, f"ocr_{filename}", str(uid),
+            ),
+        },
     )
 
 
@@ -962,6 +971,10 @@ async def preview_input(file: UploadFile = File(...),
     return StreamingResponse(
         iter([pdf_bytes]),
         media_type="application/pdf",
-        headers={"Content-Disposition": f'inline; filename="{Path(name).stem}.pdf"'},
+        headers={
+            "Content-Disposition": content_disposition(
+                "inline", f"{Path(name).stem}.pdf", "preview",
+            ),
+        },
     )
 

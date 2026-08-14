@@ -34,6 +34,7 @@ from fastapi.responses import JSONResponse, Response, StreamingResponse
 import gpu_swap
 import pipeline
 import storage
+from content_disposition import content_disposition, safe_zip_name
 from identity import Identity, identity_headers, require_user
 
 log = logging.getLogger("orchestrator")
@@ -245,8 +246,10 @@ async def translate_batch_zip(payload: dict = Body(...),
             row = await storage.fetch_translation(trans_id, identity.id)
             if not row or row.get("status") != "ok":
                 continue
-            stem = Path(row.get("original_name") or str(trans_id)).stem \
-                   or str(trans_id)
+            stem = safe_zip_name(
+                Path(row.get("original_name") or str(trans_id)).stem,
+                str(trans_id),
+            )
             for kind, ext in (("translated_docx", "docx"),
                               ("translated_json", "json")):
                 try:
@@ -335,5 +338,9 @@ async def get_translation_artifact(trans_id: str, kind: str,
     return Response(
         content=body,
         media_type=content_type,
-        headers={"Content-Disposition": f'{disposition}; filename="{filename}"'},
+        headers={
+            "Content-Disposition": content_disposition(
+                disposition, filename, str(row.get("id") or trans_id),
+            ),
+        },
     )
