@@ -20,6 +20,11 @@ class ShapeContext:
         self.zoom = zoom
         self.next_id = shape_id_start
         self.xml_chunks: List[str] = []
+        # Entries for the current page; set by json_to_docx so per-entry
+        # renderers can be obstacle-aware (a table must not grow over its
+        # neighbours). Empty when not provided, which every consumer treats as
+        # "no opinion" — so this stays a no-op for callers that never set it.
+        self.page_entries: List = []
 
     def _next_id(self) -> int:
         self.next_id += 1

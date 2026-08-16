@@ -20,7 +20,11 @@ services:
       - CHANDRA_MODEL=${CHANDRA_MODEL:-datalab-to/chandra-ocr-2}
       - GPU_MEM_UTIL=${GPU_MEM_UTIL:-0.50}
       - MAX_MODEL_LEN=${MAX_MODEL_LEN:-16384}
-      - VLLM_MAX_NUM_SEQS=${VLLM_MAX_NUM_SEQS:-8}
+      # NOT named VLLM_* on purpose: vLLM warns about ("Unknown vLLM
+      # environment variable") every VLLM_-prefixed name it does not own. This
+      # one is ours — entrypoint.sh reads it and passes it on as the
+      # --max-num-seqs CLI flag, which is how vLLM actually consumes it.
+      - OCR_MAX_NUM_SEQS=${OCR_MAX_NUM_SEQS:-8}
       - OCR_BATCH_SIZE=${OCR_BATCH_SIZE:-2}
       - OCR_BATCH_SIZE_NATIVE=${OCR_BATCH_SIZE_NATIVE:-16}
       - OCR_BATCH_SIZE_SCANNED=${OCR_BATCH_SIZE_SCANNED:-4}

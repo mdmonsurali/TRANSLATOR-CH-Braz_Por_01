@@ -383,6 +383,11 @@ def json_to_docx(layout_results, output_path="output.docx"):
             zoom=page_zoom,
             shape_id_start=shape_counter,
         )
+        # Expose the page's entries so per-entry renderers can be obstacle-aware
+        # — a table that must grow to fit its content stops at its nearest
+        # neighbour instead of running over it (the page number being the
+        # visible symptom).
+        ctx.page_entries = entries
 
         # Chandra layout labels. Pictures are Image/Figure (and a Diagram that
         # actually carries a raster crop); tables are Table; block math is

@@ -65,7 +65,11 @@ CATEGORY_BASE_SIZE_PT: Dict[str, float] = {
     "Footnote": 8.5,
     "List-item": 10.5,
     "Text": 10.5,
-    "Table": 9.5,
+    # Table cells start at the same readable size as body text. This is only the
+    # STARTING size — `table.render_table` still fits each cell — but it is now
+    # also honoured as a floor there (`TABLE_MIN_FONT_PT`), so a dense table
+    # grows rather than shrinking into illegibility.
+    "Table": 10.0,
     "Formula": 11.0,
     "Picture": 11.0,  # unused — pictures have no text
 }

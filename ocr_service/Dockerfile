@@ -52,6 +52,11 @@ RUN chmod +x /workspace/ocr_service/entrypoint.sh
 # so the two services can diverge without affecting each other.
 COPY reconstruction_service/src/ocr_reconstruction /workspace/ocr_reconstruction
 
+# Shared by BOTH reconstruction copies (translator_service ships it too), so the
+# content-vs-bbox table geometry rules cannot drift between them. Lands at
+# /workspace/table_geometry.py, which PYTHONPATH already covers below.
+COPY reconstruction_service/src/table_geometry.py /workspace/table_geometry.py
+
 # Database schema bundled into the image; applied at startup.
 COPY database/schema.sql /workspace/database/schema.sql
 
@@ -70,7 +75,7 @@ HEALTHCHECK --interval=30s --timeout=10s --retries=5 --start-period=180s \
 
 WORKDIR /workspace/ocr_service/src
 
-# entrypoint.sh probes the GPU and exports VLLM_MAX_NUM_SEQS for the right tier.
+# entrypoint.sh probes the GPU and exports OCR_MAX_NUM_SEQS for the right tier.
 # All other knobs (GPU_MEM_UTIL, MAX_MODEL_LEN, OCR_MAX_TOKENS, VLLM_PORT,
 # OCR_SERVICE_PORT) come from .env via docker-compose.
 ENTRYPOINT ["/bin/bash", "-c"]
@@ -80,7 +85,7 @@ CMD ["\
          --tensor-parallel-size 1 \
          --gpu-memory-utilization $GPU_MEM_UTIL \
          --max-model-len $MAX_MODEL_LEN \
-         --max-num-seqs $VLLM_MAX_NUM_SEQS \
+         --max-num-seqs $OCR_MAX_NUM_SEQS \
          --no-enforce-eager \
          --served-model-name $OCR_MODEL_NAME \
          --port $VLLM_PORT & \

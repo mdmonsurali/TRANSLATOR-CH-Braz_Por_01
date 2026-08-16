@@ -12,3 +12,12 @@ __pycache__/
 ocr_*.json
 7.3 Critical andor special process-1-12-35
 7.3 Critical andor special process-1-25-30
+
+# Generated reconstruction artifacts (layout JSON + rendered DOCX produced by
+# the pipeline while debugging a document). Regenerate them by re-running the
+# pipeline rather than committing them — they are large and change every run.
+translate_*.json
+translate_*.docx
+translator_*.json
+translator_*.docx
+original*.png

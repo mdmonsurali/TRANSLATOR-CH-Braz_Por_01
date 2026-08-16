@@ -45,6 +45,11 @@ COPY translator_service/src/ /workspace/translator_service/src/
 
 COPY reconstruction_service/src/translation_reconstruction /workspace/translation_reconstruction
 
+# Shared by BOTH reconstruction copies (ocr_service ships it too), so the
+# content-vs-bbox table geometry rules cannot drift between them. Lands at
+# /workspace/table_geometry.py, which PYTHONPATH already covers below.
+COPY reconstruction_service/src/table_geometry.py /workspace/table_geometry.py
+
 # Database schema bundled into the image; applied at startup (idempotent).
 COPY database/schema.sql /workspace/database/schema.sql
 
