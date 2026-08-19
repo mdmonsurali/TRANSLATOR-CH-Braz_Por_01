@@ -16,6 +16,35 @@ def _is_picture(entry) -> bool:
     return entry.get("category") in PICTURE_LABELS
 
 
+def apply_pixel_rotation(img_obj, entry: Dict):
+    """Spin a raster picture's PIXELS to match a page-level de-rotation.
+
+    `_derotate_rotated_pages` (json_to_docx.py) straightens a whole rotated
+    page by remapping every entry's BBOX and stamps the angle it used onto
+    each Image/Figure/Picture as `_pixel_rotation_deg`. That's enough for a
+    Table or Text entry — they're rebuilt as fresh OOXML (real glyphs/grid),
+    always drawn upright regardless of source orientation. A raster picture
+    is different: it's a PHOTO of the still-rotated source region, so its
+    pixel content is turned exactly as the page was and must be spun the
+    same way, or it ends up correctly placed/sized but sideways.
+
+    `_pixel_rotation_deg` follows this module's rotation convention
+    (COUNTER-CLOCKWISE-positive degrees the CONTENT is turned from upright —
+    see geometry.py's `normalize_rotation`), i.e. "90.0" means the content
+    reads bottom-to-top and needs a CLOCKWISE turn to straighten.
+    `PIL.Image.rotate(angle)` is CCW-positive (matplotlib/math convention),
+    so straightening takes the NEGATED angle: `rotate(-90)` is what turns
+    "reads bottom-to-top" content CW into upright. Verified against a real
+    document: `rotate(90)` (no sign flip) produced an upside-down mirror
+    image; `rotate(-90)` matched the source drawing exactly, and matches the
+    CW bbox remap `_map()` already applies for the same case.
+    """
+    deg = float(entry.get("_pixel_rotation_deg") or 0.0)
+    if deg in (90.0, 180.0, 270.0):
+        return img_obj.rotate(-deg, expand=True)
+    return img_obj
+
+
 def deduplicate_pictures(layout_result):
     """Remove duplicate Picture entries with identical bboxes."""
     seen_bboxes = set()
@@ -104,6 +133,7 @@ def render_standalone_picture(ctx, entry: Dict) -> None:
     img_obj = entry.get("image_obj")
     if img_obj is None:
         return
+    img_obj = apply_pixel_rotation(img_obj, entry)
     from .geometry import bbox_px_to_emu
     from .ooxml import (
         build_anchored_picture_xml, add_image_relationship,

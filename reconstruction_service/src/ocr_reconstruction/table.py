@@ -24,6 +24,7 @@ from .ooxml import (
     build_anchored_textbox_xml, build_paragraph_xml, build_run_xml,
     build_inline_picture_xml, add_image_relationship,
 )
+from .picture import apply_pixel_rotation
 from .text_fit import (
     fit_multiline, get_font, is_cjk_char, wrap_to_width, has_cjk,
     measure_width_px,
@@ -4040,6 +4041,7 @@ def render_table(
                     img_obj = pic.get("image_obj")
                     if img_obj is None:
                         continue
+                    img_obj = apply_pixel_rotation(img_obj, pic)
                     buf = BytesIO()
                     img_obj.save(buf, format="PNG")
                     buf.seek(0)

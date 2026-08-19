@@ -213,6 +213,11 @@ def _link_table_continuations(layout_results) -> None:
 # labels sitting on an upright page.
 _PAGE_ROT_AREA_RATIO = 0.5
 
+# Fraction of an untagged entry's own height that must overlap a rotated
+# sibling's y-range before that entry is folded into the rotated group (see
+# "UNTAGGED NEIGHBOURS" below).
+_ROT_NEIGHBOR_OVERLAP_RATIO = 0.6
+
 
 def _derotate_rotated_pages(layout_results) -> None:
     """Turn a page whose CONTENT is rotated into an upright LANDSCAPE page.
@@ -236,6 +241,16 @@ def _derotate_rotated_pages(layout_results) -> None:
     A page is de-rotated only when rotated entries dominate its content area
     (`_PAGE_ROT_AREA_RATIO`); a couple of turned side-labels on an otherwise
     upright page keep their per-entry `vert=` rendering instead.
+
+    UNTAGGED NEIGHBOURS. OCR's per-entry rotation vote can miss an entry that
+    is visually part of the same turned band as its rotated siblings — e.g. a
+    wide table sandwiched between two rotated tables, all sharing one y-range,
+    where only the outer two got a `table-ocr-majority` angle. Such an entry
+    is folded into the rotated side of the ratio (and inherits `page_rot`
+    below) when it y-overlaps a rotated entry by at least
+    `_ROT_NEIGHBOR_OVERLAP_RATIO` of its own height — a plain quarter-turn
+    table's rotation is a property of the physical page region, not of
+    whichever entry OCR happened to tag.
     """
     for raw_page in layout_results:
         if not isinstance(raw_page, dict):
@@ -244,9 +259,7 @@ def _derotate_rotated_pages(layout_results) -> None:
         if not entries:
             continue
 
-        rot_area = 0.0
-        total_area = 0.0
-        angles = []
+        boxes = []  # (entry, x1, y1, x2, y2, area, rot)
         for e in entries:
             bb = e.get("bbox")
             if not bb or len(bb) != 4:
@@ -255,14 +268,32 @@ def _derotate_rotated_pages(layout_results) -> None:
                 x1, y1, x2, y2 = (float(v) for v in bb)
             except (TypeError, ValueError):
                 continue
-            a = max(0.0, x2 - x1) * max(0.0, y2 - y1)
-            total_area += a
+            area = max(0.0, x2 - x1) * max(0.0, y2 - y1)
             rot = normalize_rotation(e.get("rotation"))
-            if rot in (90.0, 270.0):
-                rot_area += a
-                angles.append(rot)
-        if total_area <= 0 or not angles:
+            boxes.append((e, x1, y1, x2, y2, area, rot))
+
+        total_area = sum(b[5] for b in boxes)
+        rotated = [b for b in boxes if b[6] in (90.0, 270.0)]
+        if total_area <= 0 or not rotated:
             continue
+
+        rotated_ids = {id(b[0]) for b in rotated}
+        rot_area = sum(b[5] for b in rotated)
+        angles = [b[6] for b in rotated]
+
+        # Fold in untagged entries that share a rotated sibling's y-band —
+        # same physical turned region, just missing an OCR angle.
+        for e, x1, y1, x2, y2, area, rot in boxes:
+            if id(e) in rotated_ids or rot in (90.0, 270.0) or area <= 0:
+                continue
+            for _re, rx1, ry1, rx2, ry2, _rarea, rrot in rotated:
+                overlap = max(0.0, min(y2, ry2) - max(y1, ry1))
+                if overlap / max(1.0, y2 - y1) >= _ROT_NEIGHBOR_OVERLAP_RATIO:
+                    rot_area += area
+                    angles.append(rrot)
+                    rotated_ids.add(id(e))
+                    break
+
         if (rot_area / total_area) < _PAGE_ROT_AREA_RATIO:
             continue
 
@@ -282,10 +313,16 @@ def _derotate_rotated_pages(layout_results) -> None:
         def _map(bbox):
             x1, y1, x2, y2 = (float(v) for v in bbox)
             if page_rot == 90.0:
-                # Content reads bottom-to-top: (x, y) -> (y, pw - x).
-                return [y1, pw - x2, y2, pw - x1]
-            # 270°: content reads top-to-bottom: (x, y) -> (ph - y, x).
-            return [ph - y2, x1, ph - y1, x2]
+                # Content reads bottom-to-top (glyphs turned 90° CW from
+                # upright): straightening means rotating the page frame 90°
+                # CW, i.e. (x, y) -> (ph - y, x). Verified empirically against
+                # PIL's CW raster rotation and against this document's known
+                # top-to-bottom strip order.
+                return [ph - y2, x1, ph - y1, x2]
+            # 270°: content reads top-to-bottom (glyphs turned 90° CCW from
+            # upright): straightening rotates the page frame 90° CCW, i.e.
+            # (x, y) -> (y, pw - x).
+            return [y1, pw - x2, y2, pw - x1]
 
         for e in entries:
             bb = e.get("bbox")
@@ -299,6 +336,17 @@ def _derotate_rotated_pages(layout_results) -> None:
             # Any per-cell turn was relative to the old frame; it no longer
             # applies once the page itself is straightened.
             e.pop("cell_rotations", None)
+            # A table/text entry is rebuilt as fresh OOXML (real glyphs/grid),
+            # so straightening its BBOX is enough — the renderer always draws
+            # it upright regardless of source pixel orientation. A raster
+            # Image/Figure/Picture is a PHOTO of the rotated page region: its
+            # pixels are still turned exactly as the source was, so it needs
+            # the same corrective spin applied to its content, not just its
+            # position. Recorded here (once, where `page_rot` is known) and
+            # consumed by the picture renderers, which are the only ones that
+            # touch raw pixels.
+            if e.get("category") in ("Image", "Figure", "Picture"):
+                e["_pixel_rotation_deg"] = page_rot
 
         # The section becomes landscape (or back to portrait for a turned
         # landscape original) — a quarter turn always swaps the axes.
@@ -414,14 +462,47 @@ def json_to_docx(layout_results, output_path="output.docx"):
             return (inner[0] >= outer[0] and inner[2] <= outer[2]
                     and inner[1] >= outer[1] and inner[3] <= outer[3])
 
+        # A table's outer bbox is its full rectangular extent, which usually
+        # includes blank margin beyond the text columns (especially after a
+        # de-rotation remap). A picture whose bbox falls in that margin is NOT
+        # "inside" the table in any meaningful sense unless the table's own
+        # HTML actually places an <img> in one of its cells — cache that check
+        # per table (id -> bool) rather than per picture.
+        _table_has_img_cache: Dict[int, bool] = {}
+
+        def _table_has_image_cells(t: Dict) -> bool:
+            key = id(t)
+            if key in _table_has_img_cache:
+                return _table_has_img_cache[key]
+            has_img = False
+            for cells, _is_header in parse_html_table_rows(t.get("text") or ""):
+                if any(c[3] for c in cells if len(c) >= 4):
+                    has_img = True
+                    break
+            _table_has_img_cache[key] = has_img
+            return has_img
+
         def _picture_in_any_table(pic_entry) -> bool:
             pb = pic_entry.get("bbox")
-            return any(_bbox_inside(pb, t.get("bbox")) for t in tables)
+            return any(
+                _table_has_image_cells(t) and _bbox_inside(pb, t.get("bbox"))
+                for t in tables
+            )
 
         standalone_pics = [
             e for e in entries
             if _is_picture(e) and not _picture_in_any_table(e)
         ]
+        # Mark these as ownerless BEFORE the containment loop below: even a
+        # standalone picture can sit geometrically inside a table's outer
+        # bbox (margin space, a de-rotated frame, ...) without being claimed
+        # by any of its cells. `_table_owner_id = None` tells `_bboxes` in
+        # `table_geometry.py` this picture is a real obstacle, not content
+        # the table contains — otherwise pure bbox-containment would still
+        # exclude it and the table could grow straight through it.
+        for e in standalone_pics:
+            e["_table_owner_id"] = None
+
         # Bucket contained pictures by their owning table so each table
         # renders its own photos inside the matching cell.
         pics_per_table: Dict[int, List[Dict]] = {}
@@ -431,7 +512,10 @@ def json_to_docx(layout_results, output_path="output.docx"):
                 continue
             pb = e.get("bbox")
             for t in tables:
+                if not _table_has_image_cells(t):
+                    continue
                 if _bbox_inside(pb, t.get("bbox")):
+                    e["_table_owner_id"] = id(t)
                     if e.get("image_obj") is not None:
                         pics_per_table.setdefault(id(t), []).append(e)
                     else:

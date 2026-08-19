@@ -234,9 +234,9 @@ def _bboxes(entries: Sequence, skip,
             own: Optional[Tuple[float, float, float, float]] = None,
             ) -> List[Tuple[float, float, float, float]]:
     """Valid 4-number bboxes from `entries`, excluding the entry `skip` itself
-    and anything CONTAINED WITHIN `own`.
+    and anything CLAIMED AS `skip`'s OWN cell content.
 
-    The containment rule is essential, not a refinement. A table's own cell
+    The exclusion rule is essential, not a refinement. A table's own cell
     pictures are ordinary `Image` entries on the same page whose bboxes sit
     INSIDE the table's rectangle. Treated as neighbours they are the nearest
     thing to the right of the table's left edge, so the growth cap collapses the
@@ -244,11 +244,21 @@ def _bboxes(entries: Sequence, skip,
     a 710pt table capped to 58pt. Content a box contains cannot be an obstacle
     to that box.
 
+    "Claimed" is `_table_owner_id == id(skip)` when the caller has set that
+    marker (`json_to_docx.py` sets it once, when it decides which pictures a
+    table's own HTML actually places via `<img>` cells) — NOT bare geometric
+    containment. A picture can sit inside a table's outer bbox (its margin, a
+    de-rotated frame, ...) without belonging to any of its cells; such a
+    picture is a real obstacle and must still bound the table's width. Callers
+    that never set the marker (or pass entries without it) fall back to pure
+    containment, so this stays a drop-in for any caller unaware of ownership.
+
     Tolerant by design: entries with a missing/short/non-numeric bbox are simply
     not obstacles, because a malformed neighbour must never be able to shrink a
     table (the failure mode would be an unexplained squeeze, far worse than the
     overlap this guards against).
     """
+    skip_id = id(skip) if skip is not None else None
     out: List[Tuple[float, float, float, float]] = []
     for other in entries or ():
         if other is skip:
@@ -267,7 +277,20 @@ def _bboxes(entries: Sequence, skip,
             box[0] >= own[0] and box[2] <= own[2]
             and box[1] >= own[1] and box[3] <= own[3]
         ):
-            continue                     # our own contained content
+            has_owner_key = False
+            try:
+                has_owner_key = "_table_owner_id" in other
+            except TypeError:
+                pass
+            if has_owner_key:
+                # Caller resolved ownership explicitly: exclude only when
+                # THIS table claimed it. `None` means "confirmed unowned"
+                # (e.g. a standalone picture) and must NOT be excluded even
+                # though it is geometrically inside `own`.
+                if other.get("_table_owner_id") == skip_id:
+                    continue
+            else:
+                continue                  # no ownership info: fall back to containment
         out.append(box)
     return out
 
